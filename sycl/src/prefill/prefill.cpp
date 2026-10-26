@@ -122,6 +122,20 @@ inline int64_t stream_all_min() {
     static const int64_t v = [] { const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN"); return e ? (int64_t) std::atoll(e) : (int64_t) 1024; }();
     return v;
 }
+// Storm control (2026-10-26): the A750 prompt-deadlock fix from upstream 0.1.48, ported inverted - opt-in here, so
+// the default path is byte-identical.  SYCL has no cudaHostRegister: what this engine calls the "pinned" expert
+// arena is ordinary pageable VirtualAlloc memory (the registration is a DPCT no-op), and a DMA whose source is that
+// arena makes Level Zero copy through the driver's own staging buffers - on a Linux A750 that never finished on
+// some prompts.  STRATA_PF_DMA_STAGED=1 makes every prompt-path DMA decision treat its expert as not pinned, so
+// each staging copy's source is the stager's real pinned buffer (the path unpinned experts already take).  It
+// costs one extra host memcpy per streamed expert: a diagnostic arm (bench/arms k22ctx32kstaged), not a default.
+// Upstream's exemption for USM host sources is skipped: the Windows USM mirror is off (size 0), so no arena
+// expert is USM host today; re-add it only asking the stage's OWN queue (not the first card's context, the T3
+// failure) and only if the mirror ever gets a nonzero size.
+inline bool pf_dma_staged() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_PF_DMA_STAGED"); return e != nullptr && e[0] == '1'; }();
+    return v;
+}
 double g_pinned_share = 1.0;
 // SYCL port: the share of (layer, expert) pairs the VRAM cache does not hold (set_nonresident_share, from generate.cpp)
 double g_nonres_share = 0.0;
@@ -2575,7 +2589,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     } else {
                         b = m.src->blob(l, e);
                         if (!b) { err = "prefill: expert source has no blob"; return false; }
-                        if (ps_on && m.src->pinned(l, e)) {   // multi-GPU: every ps_frac-th one goes to the peer's ring
+                        if (ps_on && m.src->pinned(l, e) && !pf_dma_staged()) {   // multi-GPU: every ps_frac-th one goes to the peer's ring
                             ps_acc += m.pp->ps_frac;
                             if (ps_acc >= 1.0) {
                                 ps_acc -= 1.0;
@@ -2584,7 +2598,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                 continue;
                             }
                         }
-                        if (!m.src->pinned(l, e)) {
+                        if (!m.src->pinned(l, e) || pf_dma_staged()) {   // staged: even an arena-pinned expert goes through the stager's pinned buffer
                             job = (int) js.size();
                             js.push_back({b, (size_t) lay0.blob_bytes(l)});
                         }
@@ -3843,7 +3857,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             for (size_t j = 0; j < order.size(); ++j) {
                                 const int32_t e = order[j];
                                 if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
-                                if (m.src->pinned(l, e)) continue;
+                                if (m.src->pinned(l, e) && !pf_dma_staged()) continue;   // staged: pinned experts queue a stager job too
                                 job_of[j] = (int) js.size();
                                 if (gsrc != nullptr) {   // SYCL port: --stream-experts - the stager's thread reads it from the GGUF
                                 js.push_back({nullptr, (size_t) lay.blob_bytes(l), nullptr, (int32_t) l, e, gsrc});
@@ -3868,7 +3882,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             const int sl = stage_next;
                             stage_next = (stage_next + 1) % stage_slots();
                             const auto th = Clock::now();
-                            const bool pinned = m.src->pinned(l, e);   // pinned: never transient
+                            const bool pinned = m.src->pinned(l, e) && !pf_dma_staged();   // pinned: never transient; staged: always the stager's buffer
                             const uint8_t* b = pinned ? m.src->blob(l, e) : nullptr;
                             if (pinned && !b) { err = "prefill: expert source has no blob"; return false; }
                             if (pinned) {
