@@ -234,3 +234,26 @@ trusting it in production, and the staged promotion waits for its own speed numb
 recipe (`--spec-follow` + `--window-hashes`, `--adapt-every 0`, same shape, several starts; first differing window
 hash names where the arithmetic changed; if the CLI will not storm at all, that is item 1's answer from a second
 angle and serve-mode `STRATA_FOLLOW` becomes worth porting).
+
+### Results (evening of 2026-10-26, both arms run on this PC)
+
+`k22ctx32kstatic`: **3/3 sessions finished clean** - 18 fresh 4K requests, prompt medians 444.8-447.4 tok/s
+(the baseline's clean band is 425-445, its storming reads were 539-541), zero suffix-draft accepts, zero
+non-finite lines across 789 log lines. Baseline `k22ctx32k`: 0/3 clean. With the tier parked, nothing else in
+this shape's traffic changed, so the adaptive tier's live rewrite of the host residency table is the implicated
+lane. Evidence, not proof - the race itself is still unwitnessed in the code. Interim adopted: `--adapt-every 0`
+added to `strata-iq2_xs-2card-k22-ctx64k.json` (the daily default; note it doubles as the arms base, so future
+baseline arms inherit the interim too).
+
+`k22ctx32kstaged`: polluted in session 1 with the usual fingerprint (suffix drafts 3/3 accepted, fast-side
+prompt) - **but as run it tested nothing.** The daily shape uses `--stream-experts`, and that source reports
+`pinned()` true only for mirror-backed experts, with the mirror off on Windows: every expert already took the
+stager's pinned-buffer path, so the switch was inert and the session was the baseline restated. The A750
+mechanism is real for the arena and mirror sources (`--mmap-experts` shapes, or `STRATA_MIRROR_MIB > 0`), not
+for this stream shape; a staged test needs one of those. The port itself stays default-identical and ready.
+
+Next step, suspect narrowed: make the tier safe rather than parked - swaps must not land between a prompt path's
+read of the residency table and the copies that read scheduled (tick the tier only between requests, or snapshot
+the table per request; both keep the cross-request learning `--adapt-every 0` gives up). Needs its own arm
+(same shape, same gate) and a soak before production. If anything still storms with the tier parked, item 3's
+window hashes.
