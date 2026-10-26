@@ -257,3 +257,16 @@ read of the residency table and the copies that read scheduled (tick the tier on
 the table per request; both keep the cross-request learning `--adapt-every 0` gives up). Needs its own arm
 (same shape, same gate) and a soak before production. If anything still storms with the tier parked, item 3's
 window hashes.
+
+### Paired 5+5 run (late 2026-10-26): the tie
+
+`BENCH_REPEATS=5`, one ladder: `k22ctx32kstatic` 5/5 clean (8/8 cumulative for the parked tier on the current
+engine, 48 fresh 4K requests) and `k22ctx32ktier4` (adaptive restored: `--adapt-every 4`, and `--adapt-swaps`
+defaults to 96 with the profile present, so the tier was genuinely armed) also 5/5 clean - 30 prompts all in
+the clean band (442-458 tok/s), no storm-side fast reads. The with-tier shape's record on the current engine is
+therefore 1 polluted session in 6 (yesterday's staged restatement); on the 10-16 era engine it was 3/3 and
+worse. Two readings survive: the storm's base rate fell below what 5 sessions can catch (something else in the
+65 commits since 10-16 already helped, or the environment matters), or the parked tier's 0-in-8 clean record
+was luck. Parked remains the only state that has never polluted; interim stays. To settle it: more shots at the
+with-tier shape (BENCH_RUNS=12 raises ignition chances per minute), or build the between-requests tick gate as
+cheap insurance - it preserves cross-request adaptation and can be validated against tier4 with these same arms.
