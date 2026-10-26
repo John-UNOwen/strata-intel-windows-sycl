@@ -206,3 +206,31 @@ What this means here:
 2. Port item 2 behind `STRATA_PF_DMA_STAGED=1`, build JIT and AOT, add `k22ctx32kstaged`.
 3. If a storm still lights with both controls on, use item 3 to find the window.
 4. Then the speed ports in order 4, 5, 6, each opt-in, each with its own arm and the pollution gate on.
+
+## Running the two controls (done 2026-10-26)
+
+Both arms are in `bench/arms/make_arms_k22.py`: `k22ctx32kstatic` (`--adapt-every 0`) and `k22ctx32kstaged`
+(`STRATA_PF_DMA_STAGED=1` in the env; the code landed behind that switch in `sycl/src/prefill/prefill.cpp` at
+four `pinned()`-keyed DMA decision points, the peer `ps_frac` branch included, and both builds rebuilt after it).
+The name prefix auto-arms both with `STRATA_DBG_WINDOW`/`STRATA_DBG_NAN_DEFER` like the baseline.
+
+Read the storm rate, not speed: baseline `k22ctx32k` polluted all 3 sessions run, and a polluted session skips
+that arm's rest, so clean here means 3/3 sessions finished; one storm is a failure. Both controls cost speed by
+design.
+
+Close VicGPT's llama-server first and leave ports 8191-8240 free. From this folder's cmd window:
+
+    set BENCH_SUITES=4K & set BENCH_RUNS=6 & BENCH-ARMS.bat k22ctx32kstatic
+    set BENCH_SUITES=4K & set BENCH_RUNS=6 & BENCH-ARMS.bat k22ctx32kstaged
+
+6-12 min per session plus 1-3 min engine load; keep Task Manager's GPU page open and stop on shared GPU memory
+over ~0.2 GB, B580 dedicated near ~11.3 GB, or a flicker.
+
+What to do with the answers: static clean and staged storming - the swap/table lane is implicated, design the
+per-stage queue barrier for the swap path (item 1's stated fix) and keep `--adapt-every 0` as the interim VicGPT
+setting. Staged clean and static storming - the DMA-from-pageable path is implicated: promote the staged copy with
+numbers and keep the adaptive tier. Both clean - adopt `--adapt-every 0` interim, run a ~40-session soak before
+trusting it in production, and the staged promotion waits for its own speed numbers. Both storming - item 3's CLI
+recipe (`--spec-follow` + `--window-hashes`, `--adapt-every 0`, same shape, several starts; first differing window
+hash names where the arithmetic changed; if the CLI will not storm at all, that is item 1's answer from a second
+angle and serve-mode `STRATA_FOLLOW` becomes worth porting).
