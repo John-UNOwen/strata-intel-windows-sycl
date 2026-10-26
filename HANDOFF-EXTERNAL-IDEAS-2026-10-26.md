@@ -270,3 +270,11 @@ worse. Two readings survive: the storm's base rate fell below what 5 sessions ca
 was luck. Parked remains the only state that has never polluted; interim stays. To settle it: more shots at the
 with-tier shape (BENCH_RUNS=12 raises ignition chances per minute), or build the between-requests tick gate as
 cheap insurance - it preserves cross-request adaptation and can be validated against tier4 with these same arms.
+
+Follow-up the same night: tier4 only, 5 more sessions at 4K + 8K (`BENCH_RUNS=5`) - all clean. The armed shape is
+now 10 clean sessions of 11 on the current engine (the one pollution is yesterday's staged restatement), against
+0 polluted in 8 parked sessions. First 8K-phase numbers on this PC: 8020 tokens read at 510 tok/s median
+(4019 at 440) - faster per token than 4K by size effect (per-chunk overhead amortized), tight distribution, no
+ignition at the extra chunk boundary. The storm's current-engine rate is ~1 session in 11 with the tier armed;
+whatever cut it from the 10-16 era's 3-of-3 has already landed. Parked stays as interim; the between-requests
+tick gate remains the path to running the tier again without the risk.
