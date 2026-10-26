@@ -291,3 +291,16 @@ identical between them. Validation arm: `k22ctx32ktier4gated` (tier4 + `--adapt-
 with `k22ctx32ktier4`; read gated's clean rate and its prompt medians against tier4 (a boundary round that
 lands on a request slows that request's TTFT - the accepted cost). If it holds, the daily config takes
 `--adapt-every 4 --adapt-idle 1` and the interim parks.
+
+### Adopted (2026-10-26, end of day): the gate ran clean at zero measurable cost
+
+`k22ctx32ktier4gated` 5/5 clean next to `k22ctx32ktier4` 5/5 (tier4 now 15 clean of 16 armed sessions on the
+current engine). Prompt medians and TTFT ranges are statistically indistinguishable from mid-request tiering
+(4K: 441-443 vs 440-443 median, TTFT 9.06-9.44 vs 9.12-9.39 s; 8K likewise) - boundary rounds are sub-100 ms
+on this pack and traffic, so the table freeze comes free here. The daily config now runs
+`--adapt-every 4 --adapt-idle 1`; the interim (`--adapt-every 0`) is retired. Honest scope of the claim: the
+gate removes the only known ignition window BY DESIGN (no table or slot mutation can land mid-request), and the
+arm run proves it runs clean at zero cost, but the engine's current storm rate (~1 session in 16 armed) is too
+low for the run to demonstrate prevention statistically. Overnight VicGPT use is the acceptance test; if a
+storm still appears with the gate on, the shape has a mechanism the tier theory does not explain and item 3's
+window hashes are the next tool.
