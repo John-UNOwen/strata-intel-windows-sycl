@@ -278,3 +278,16 @@ now 10 clean sessions of 11 on the current engine (the one pollution is yesterda
 ignition at the extra chunk boundary. The storm's current-engine rate is ~1 session in 11 with the tier armed;
 whatever cut it from the 10-16 era's 3-of-3 has already landed. Parked stays as interim; the between-requests
 tick gate remains the path to running the tier again without the risk.
+
+### The gate is implemented (2026-10-26, commit `929c21e0`)
+
+`--adapt-idle 1` (default off, byte-identical otherwise): the tier keeps its every-N-windows schedule, but a due
+round only runs at the request boundary - after the existing drains, before the prompt starts - so the residency
+table and cache slots are frozen for a request's whole life. Covers every start site the serve paths have (the
+async worker's Idle start, the pipeline `pl_adapt` kick, the serial blocking kick; batch decode steps never
+start rounds, only drain, so they needed nothing). One design note: a boundary runs at most one round, so long
+prompts adapt more slowly than mid-request tiering - commented at the block. Both builds rebuilt, `--help`
+identical between them. Validation arm: `k22ctx32ktier4gated` (tier4 + `--adapt-idle 1`) - run it in one ladder
+with `k22ctx32ktier4`; read gated's clean rate and its prompt medians against tier4 (a boundary round that
+lands on a request slows that request's TTFT - the accepted cost). If it holds, the daily config takes
+`--adapt-every 4 --adapt-idle 1` and the interim parks.
