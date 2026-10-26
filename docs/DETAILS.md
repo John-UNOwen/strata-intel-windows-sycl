@@ -177,6 +177,10 @@ other ~18 GB), a 32 GB PC with a 12-16 GB GPU the Coder; IQ3_XXS on a 32 GB PC s
   rounds differently from the CPU) depends on when its copy lands.
   It stays on the blocking tier (said in the log) when the exchange buffers are not page-locked; the stats line
   reports ms per round.
+- `--adapt-idle 1` (opt-in, `--serve`): the adaptive tier's rounds run only between requests - no residency-table or
+  cache-slot change while a request is in flight; a due round runs at the next request start, before the prompt
+  begins (its wait before the first token is the accepted cost). Mid-request starts are suppressed on every tier
+  path (async, blocking and `--pipeline-windows`); the drains are unchanged.
 - **The arena too** (one GPU, no layer split): with every expert in RAM `--adapt-async 1` runs the same tier copy-in only:
   nothing to copy back or move into RAM. The evicted slot is marked non-resident before the round's copies are posted, and an
   expert becomes resident only once its copy has landed; `STRATA_ADAPT_ASYNC_WAIT=1` (the default there) waits for the round at

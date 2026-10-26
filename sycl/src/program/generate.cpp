@@ -675,6 +675,11 @@ struct Options {
     /// windows on a helper thread instead of one window waiting for a whole round (see the tier in the --serve block).
     /// Not bit-exact run to run.  0 = the blocking tier.
     int adapt_async = 0;
+    /// --adapt-idle 1 (--serve; opt-in): adaptive tier rounds run only between requests - no residency-table or
+    /// cache-slot change while a request is in flight, so the table is frozen for a request's whole life.  A due
+    /// round runs at the next request start, before its prompt begins (that wait is the accepted TTFT cost).
+    /// 0 (default) = a due round may start mid-request, as always.
+    int adapt_idle = 0;
     /// Plan v0.3 P6: a draft enters the verify window only while every draft before it (and itself) has at least
     /// this probability under the draft layer; 0 = always --spec-1 drafts.
     double spec_min_p = 0.0;
@@ -975,7 +980,11 @@ void usage() {
                  "                       does not fit.  Same answers as --mmap-experts for the same placement.\n"
                  "  --adapt-async 1      --serve with the resident RAM mode (opt-in): the adaptive tier's swaps\n"
                  "                       advance between verify windows instead of a window waiting for a whole\n"
-                 "                       round.  Not bit-exact run to run.  0 (default) = the blocking tier.\n");
+                 "                       round.  Not bit-exact run to run.  0 (default) = the blocking tier.\n"
+                 "  --adapt-idle 1       --serve (opt-in): adaptive tier rounds run only between requests - no\n"
+                 "                       residency-table or cache-slot change while a request is in flight; a due\n"
+                 "                       round runs at the next request start, before the prompt begins (the TTFT\n"
+                 "                       cost is accepted).  0 (default) = a due round may start mid-request.\n");
 }
 
 // --lookup-chain: the context's last tokens for the draft sources (at most 64), the MTP's pending drafts last
@@ -1904,6 +1913,7 @@ int main(int argc, char **argv) try {
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
         else if (a == "--adapt-decay") o.adapt_decay = (float) std::atof(next("--adapt-decay"));
         else if (a == "--adapt-async") o.adapt_async = std::atoi(next("--adapt-async")) != 0 ? 1 : 0;
+        else if (a == "--adapt-idle") o.adapt_idle = std::atoi(next("--adapt-idle")) != 0 ? 1 : 0;
         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--spec-split") o.spec_split = true;
@@ -8466,14 +8476,20 @@ int main(int argc, char **argv) try {
         }
         };
         // between windows: `drain` finishes the round in flight and starts none.  False when a copy failed.
-        auto adapt_tick = [&](bool drain) -> bool {
+        // `run_due` (--adapt-idle, at a request boundary): nothing else is in flight - run a due round straight
+        // through to its flip, blocking here; paying its time before the prompt starts is the accepted TTFT cost
+        // of freezing the table for the request.  `allow_start` (--adapt-idle, at mid-request ticks): false
+        // never starts a round here - a due one waits for the next request boundary (drains are unchanged).
+        auto adapt_tick = [&](bool drain, bool run_due = false, bool allow_start = true) -> bool {
             if (!ajob) return true;
-            if (!drain) ++a_win;   // one tick per window
+            const bool fin = drain || run_due;   // finish the round in flight: wait at every step
+            if (!fin) ++a_win;   // one tick per window
             for (;;) {
                 if (a_err.load()) return false;
                 switch (astate) {
                 case AState::Idle:
-                    if (drain || a_win - a_last < (int64_t) o.adapt_every) return true;
+                    if (drain && !run_due) return true;
+                    if (!allow_start || a_win - a_last < (int64_t) o.adapt_every) return true;
                     a_last = a_win;
                     ++a_rounds;
                     a_t0 = Clock::now();
@@ -8486,7 +8502,7 @@ int main(int argc, char **argv) try {
                     astate = AState::CopyBack;
                     return true;
                 case AState::CopyBack: {   // step 2: the evicted experts leave the GPU's plan
-                    if (!a_ready(drain)) return true;
+                    if (!a_ready(fin)) return true;
                     if (a_err.load()) return false;
                     size_t k = 0;
                     for (size_t i = 0; i < aswaps.size(); ++i) {
@@ -8506,11 +8522,11 @@ int main(int argc, char **argv) try {
                     res_upload();
                     ajob->post(a_copy_in);
                     astate = AState::SwapIn;
-                    if (!drain) return true;
+                    if (!fin) return true;
                     continue;
                 }
                 case AState::SwapIn:   // step 3: the new experts are in their slots
-                    if (!a_ready(drain)) return true;
+                    if (!a_ready(fin)) return true;
                     if (a_err.load()) return false;
                     for (const ASwap& w : aswaps) {
                         host_res[(size_t) w.layer * g.n_expert + w.in] = w.slot;
@@ -8520,10 +8536,10 @@ int main(int argc, char **argv) try {
                     a_swapped += (int64_t) aswaps.size();
                     ajob->post([&] { src.commit_copies(); });
                     astate = AState::Commit;
-                    if (!drain) return true;
+                    if (!fin) return true;
                     continue;
                 case AState::Commit:   // step 4
-                    if (!a_ready(drain)) return true;
+                    if (!a_ready(fin)) return true;
                     if (a_err.load()) return false;
                     src.commit_flip();
                     a_ms += std::chrono::duration<double, std::milli>(Clock::now() - a_t0).count();
@@ -8764,6 +8780,7 @@ int main(int argc, char **argv) try {
         std::fflush(stdout);
         std::string line;
         int64_t rounds = 0;
+        int64_t blk_last = 0;   // --adapt-idle: the windows completed when the blocking tier last started a round (the due check at request starts)
         const int S = o.spec;
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
         if (use_mtp && S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
@@ -10543,6 +10560,26 @@ int main(int argc, char **argv) try {
                 std::printf("ERR an adaptive refill failed\n");
                 return 1;
             }
+            // --adapt-idle 1: the tier moved here.  With the drain above done nothing else is in flight, so a due
+            // round can block here until its flip lands: the residency table is then frozen for this request's
+            // whole life, and its wait before the prompt is the accepted TTFT cost.  Same cadence as the
+            // mid-request rule on the same counters: the async tier's a_win - a_last, and `rounds` since blk_last
+            // for the blocking tier (the pipeline path's windows count into `rounds` too, so this covers it).
+            if (o.adapt_idle) {
+                bool idle_err = false;
+                if (ajob) {   // --adapt-async: run the due round (if any) straight through to its flip
+                    if (!adapt_tick(false, true)) idle_err = true;
+                } else if (!drive.d.usage.empty() && o.adapt_every > 0 &&
+                           rounds - blk_last >= (int64_t) o.adapt_every) {   // due on the blocking tier's cadence
+                    blk_last = rounds;
+                    if (!adapt()) idle_err = true;
+                    apply_pending(true);   // the whole round lands before the prompt lends any slot
+                }
+                if (idle_err) {
+                    std::printf("ERR an adaptive refill failed\n");
+                    return 1;
+                }
+            }
             // per-request sampling for the verify window's head (greedy when temperature is absent)
             strata::kernels::SamplerParams req_sp;
             req_sp.greedy = req_temperature <= 0.0f;
@@ -11014,8 +11051,9 @@ int main(int argc, char **argv) try {
                     }
                     if (pl_adapt_thr.joinable()) return true;   // still adapting
                     pl_apply();
-                    if (!drive.d.usage.empty() && o.adapt_every > 0 && (rounds % o.adapt_every) == 0 && pending.empty() &&
-                        !exch_wait) {
+                    // --adapt-idle 1: no round starts beside the pipeline; the request-boundary block runs it
+                    if (!drive.d.usage.empty() && o.adapt_every > 0 && !o.adapt_idle && (rounds % o.adapt_every) == 0 &&
+                        pending.empty() && !exch_wait) {
                         pl_adapt_done = false;
                         pl_adapt_thr = std::thread([&] { pl_adapt_ok = adapt(); pl_adapt_done = true; });
                     }
@@ -11464,7 +11502,8 @@ int main(int argc, char **argv) try {
                 // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
                 if (adapt_nowait()) apply_pending(false);
                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
-                if (!adapt_tick(false)) {   // --adapt-async: the round in flight moves on a step when it can
+                if (!adapt_tick(false, false, !o.adapt_idle)) {   // --adapt-async: the round in flight moves on a step
+                    // when it can; --adapt-idle: a due round waits for the next request boundary (the block above)
                     std::printf("ERR an adaptive refill failed\n");
                     return 1;
                 }
@@ -11507,8 +11546,9 @@ int main(int argc, char **argv) try {
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
-                // (--adapt-async 1: the asynchronous tier above instead, ticked before the window)
-                if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_every) == 0)
+                // (--adapt-async 1: the asynchronous tier above instead, ticked before the window;
+                //  --adapt-idle 1: no round starts here, the request-boundary block runs the due one)
+                if (!drive.d.usage.empty() && !ajob && !o.adapt_idle && ((rounds + 1) % o.adapt_every) == 0)
                     adapt_thr = std::thread([&] { adapt_ok = adapt(); });
                 if (!ver.commit(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
