@@ -8,6 +8,7 @@
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <cstdlib>
 #include <cstdio>
+#include <atomic>
 #include "strata/sycl_queue.hpp"
 #include "strata/prefill/xmx_moe.hpp"
 
@@ -148,24 +149,35 @@ int fill(Grp& gp, const int32_t* cnt, int n) {
 int mode() {
     // The kernels are joint_matrix 8x8x16 on sub-group 8 (DG2, Arc A-series) or, in a STRATA_XMX_SG16 build, 8x16x16 on
     // sub-group 16 (Xe2, Battlemage).
-    static const int v = [] {
-        const char* e = std::getenv("STRATA_PF_XMX");
-        const int want = e ? std::atoi(e) : 0;
-        if (want == 0) return 0;
+    // Per device, cached by device id - prompt_f16's pattern (kernels/gemm.dp.cpp).  As one function static this let
+    // the first caller's q_of(nullptr) decide for all cards: on a B580 + A770 layer split the setup thread (device 0)
+    // answered, Battlemage read as ignored, and the A770 inherited an off that was never its answer.  Each stage
+    // brings its own device as the current one - the OnDevice at the run_impl head (prefill.cpp:2152), the guards
+    // around init/relayout (generate.cpp:6960/10443) that carve's ring allocations run under - so asking the current
+    // device here answers each stage.  want == 0 (the default) returns before any of this.
+    static const int want = [] { const char* e = std::getenv("STRATA_PF_XMX"); return e ? std::atoi(e) : 0; }();
+    if (want == 0) return 0;
+    const int dev = (int) dpct::get_current_device_id();
+    constexpr int kMaxXmxDev = 16;                        // device ids past this: computed, not cached
+    static std::atomic<int8_t> cached[kMaxXmxDev] = {};   // 0 unknown, 1 off, want + 1 on
+    if (dev >= 0 && dev < kMaxXmxDev) {
+        const int8_t c = cached[dev].load(std::memory_order_relaxed);
+        if (c) return (int) c - 1;
+    }
+    int8_t v = (int8_t) (want + 1);
 #ifdef STRATA_NO_DG2_XMX
-        std::fprintf(stderr, "STRATA_PF_XMX ignored: this build is AOT for a device without the sub-group 8 XMX kernels\n");
-        return 0;
+    std::fprintf(stderr, "STRATA_PF_XMX ignored on device %d: this build is AOT for a device without the sub-group 8 XMX kernels\n", dev);
+    v = 1;
 #else
 #ifndef STRATA_XMX_SG16
-        if (strata::intel_gpu_gen(strata::q_of(nullptr)->get_device()) == strata::IntelGpuGen::Battlemage) {
-            std::fprintf(stderr, "STRATA_PF_XMX ignored: this build has the sub-group 8 / 8x8x16 kernels (Arc A-series); Battlemage needs the AOT bmg build\n");
-            return 0;
-        }
+    if (strata::intel_gpu_gen_of(strata::q_of(nullptr)->get_device()) == strata::IntelGpuGen::Battlemage) {
+        std::fprintf(stderr, "STRATA_PF_XMX ignored on device %d: this build has the sub-group 8 / 8x8x16 kernels (Arc A-series); Battlemage needs the AOT bmg build\n", dev);
+        v = 1;
+    }
 #endif
-        return want;
 #endif
-    }();
-    return v;
+    if (dev >= 0 && dev < kMaxXmxDev) cached[dev].store(v, std::memory_order_relaxed);
+    return (int) v - 1;
 }
 bool enabled() { return mode() != 0; }
 
