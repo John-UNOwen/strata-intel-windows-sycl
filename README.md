@@ -30,6 +30,15 @@ agents. Your chats and files stay on your PC.
 > upstream Strata on that PC: [docs/COMPARISON.md](docs/COMPARISON.md). Its configs, and how to run them:
 > [examples/](examples/README.md).
 
+> **This branch** (`local-patches`, on top of `custom`) adds two things to the fork's engine:
+>
+> - **Token biases.** Requests can send `logit_bias` (`{"token_id": bias}`, -100 bans a token), as described in
+>   [docs/LOGIT_BIAS.md](docs/LOGIT_BIAS.md). The fork's engine did not read it before. A config can also set a default
+>   for requests that send none: `"sampling": { "logit_bias": { "50615": -3 } }`. The bias works with a second GPU too.
+> - **A cap on locked RAM (Windows).** `"STRATA_ARENA_PIN_GIB": "N"` in the config's `"env"` block locks at most N GiB of
+>   RAM for the experts; the rest stays in normal memory. Windows can let the engine lock more than the graphics driver
+>   can use, and the expert cache then fails with "out of memory" while it fills. Unset, nothing changes.
+
 **New here?** Check [what you need](#what-you-need), then [install the app](#option-a-the-strata-app).
 
 - **Runs on a gaming PC.** 32 GB of RAM and graphics memory together is enough to start.

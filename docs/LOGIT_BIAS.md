@@ -72,5 +72,8 @@ batching (`--batch`), rather than being silently ignored. The engine advertises
 MTP target verification applies the bias; the draft model is not biased, so a
 restrictive list may reduce draft acceptance. Ordinary MTP was tested. The
 experimental coupled/rejection-sampling combinations and multi-GPU execution
-were not validated in this campaign. There is no startup bias-file option in
-this change: send the field with each request.
+were not validated in this campaign.
+
+A config can set a default for requests that send no `logit_bias`:
+`"sampling": { "logit_bias": { "50615": -3 } }`. A request's own `logit_bias`
+replaces the default (`null` keeps it).
