@@ -343,6 +343,26 @@ control median is the real bar), and the engine auto-disabling drafts mid-run is
 `BENCH_SUITES=chat,4K`, `BENCH_RUNS=4`, `BENCH_REPEATS=3`, arms `k22ctx32k k22ctx32kmtp`. A clean loss
 completes the park's ledger honestly; a win reopens it with the k22-mtp NaN story.
 
+### MTP retry result (2026-10-30, 05:42-05:50): the drafter relights pollution, the gate does not cover it
+
+- Control `k22ctx32k` (gated, no drafter): 3/3 clean sessions; chat decode medians 18.1 / 18.0 / 19.2 tok/s,
+  4K medians 442.6 / 411.4 / 441.1 - ordinary bands.
+- `k22ctx32kmtp` (gated): first session polluted in the chat phase; the gate aborted its remaining sessions.
+  Its pre-pollution replies decoded 14.1-17.2 tok/s - below the control band, with decode cache hits at 50.5%
+  (the drafter's 839 MiB squeezed the cache) - then the loop run: 28.4 tok/s with **48 of 48 windows' suffix
+  drafts accepted**, the classic fingerprint, now with the gate live and the tier schedule frozen at every
+  request boundary.
+
+The park stands, on its own terms, and this retry adds the sharper fact: **every k22 session ever measured
+with `--mtp` enabled has polluted** (2026-10-16 and 2026-10-30 alike), while same-day sessions without it run
+clean under the same gate. The adaptive-tier gate closes one ignition window; nothing in `--adapt-idle`
+addresses the drafter's own mid-request work (draft K/V updates, its side-branch queue on the A770). The
+park's bar - "a clean k22 mtp run beats the baseline" - has now been tested under the cleanest conditions
+that ever existed on this PC, and the run polluted before a single speed number could land. If anyone wants
+the drafter on this split anyway, the next tools are item 3's window hashes on exactly this shape (it is
+deterministic) or a `STRATA_DBG_WINDOW` diff against today's pair; both would hunt the drafter's pollution
+lane, not the tier's.
+
 ### Review found a gate bug - async path only
 
 External review of the gate: with `--adapt-async 1`, the request-boundary call `adapt_tick(false, true)`
@@ -354,6 +374,14 @@ through its flip; mid-request starts (`fin` false) return exactly where they alw
 and pipeline boundaries were always correct (`adapt(); apply_pending(true)` finishes before the prompt), and
 the async worker only exists with `--adapt-async 1` plus the resident RAM mode - the daily shape runs neither
 (default off; `--stream-experts` on 32 GB cannot provide resident mode), so every measurement in this file
-was produced on the correctly-gated path. The fix is verified against the code and applied to the tree; both
-builds rebuild after the ladder running on this PC completes (ninja would take cores from the CPU expert lane
-and contaminate the measurement in progress), then commit.
+was produced on the correctly-gated path. The fix rebuilt in both builds (JIT + AOT) as commit `14aa7933`;
+default, blocking and pipeline behavior are byte-identical - it only engages with `--adapt-async 1`.
+
+### B580 reserve tuning (2026-10-30)
+
+The "spare ~1 GB" on the B580 is the engine's own `--vram-reserve-mib 1536` holding it back by design (late
+allocations + driver churn; the machine has a no-room shutdown crash and an ~11.3 GB dedicated watch-line in
+its history). The daily config now runs `--vram-reserve-mib 1024`: ~512 MiB returns to the B580 expert cache
+(~+340 of the 5420 slots at the 32K/64K fills) and Task Manager should settle near 10.4/12 GB dedicated.
+The user is watching the card; anything pushing B580 dedicated past ~11.3 GB or shared GPU memory past 0.2 GB
+goes back toward 1300 or 1536.
