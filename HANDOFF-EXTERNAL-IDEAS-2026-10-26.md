@@ -465,6 +465,6 @@ the next arms.)
 
 **Housekeeping**
 
-10. **Merge upstream SYCL 0.1.45-0.1.48 in small steps.** It holds items 5 and 6 above (large GRF, planar Q6_K
-    head), the pageable-DMA fix (already ported) and upstream's Alchemist defaults. One step per arm round, with
+10. **Merge upstream SYCL 0.1.45-0.1.48 in small steps.** It holds the large-GRF kernels and the planar Q6_K
+    head (sections 5 and 6 of this file), the pageable-DMA fix (already ported) and upstream's Alchemist defaults. One step per arm round, with
     the gate, so a new storm can be tied to a step.
