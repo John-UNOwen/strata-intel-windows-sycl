@@ -468,3 +468,45 @@ the next arms.)
 10. **Merge upstream SYCL 0.1.45-0.1.48 in small steps.** It holds the large-GRF kernels and the planar Q6_K
     head (sections 5 and 6 of this file), the pageable-DMA fix (already ported) and upstream's Alchemist defaults. One step per arm round, with
     the gate, so a new storm can be tied to a step.
+
+## Code phase done (2026-10-30, commits on main, both builds rebuilt per file)
+
+Every switch below is opt-in; with its env unset every code path is the one that ran before, and `--help` is
+byte-identical across the JIT and AOT builds. Nothing is adopted into the daily config - all of it awaits numbers.
+
+- **Item 2 - XMX per device** (`44a7a394`): `xmx::mode()` caches its answer per device id (the `prompt_f16`
+  pattern), so the B580's "ignored" no longer silences the A770. `stage_slots()` / `dq_slots()` needed no change:
+  both ask `mode()`, and every path that calls them (run_impl's stage thread, the OnDevice guards around
+  init/relayout and carve) already carries its stage's device. Arm `k22pfxmx1` (`STRATA_PF_XMX=1`, 32K shape).
+- **Item 5 - large GRF** (`624e9747`): the 2-8 column wide MMVQ launches relaunch with `grf_size<256>` when
+  `STRATA_MMVQ_LARGE_GRF=1`, per device, Alchemist only. Transplanted from `upstream/main` (no 0.1.48 tag exists -
+  the tags run to 0.2.8). Skipped with cause: the third upstream site lives inside planar Q6_K (this tree lacks that
+  feature), and the upstream `ld_i4_a4`/q6_sub32 kernel-body hunks belong to a different optimization that would
+  move default-path codegen. Arm `k22grf`.
+- **Item 9 - one-chunk prompt help in copy mode** (`1bbe3330`): the Windows split no longer refuses the helper. Per
+  f4fc1e3's pattern: buffers the helper card's kernels read are mapped through that card, the primary keeps its own,
+  and each reader's queue bridges with a memcpy after the existing event barriers. Frees run under the owning
+  context. Still gated by `STRATA_PREFILL_HELP` (unchanged opt-in); engages only for 1024..3276-token one-chunk
+  prompts. Arm `k22help` at the 64K shape (the 32K arms chunk-split a 2K prompt), and `strata_bench.py` gained a 2K
+  phase (`2724830a`) because no existing phase lands in that band.
+- **Item 4 - pinned mirror lane per stage** (`2724830a`): `GgufExpertSource::mirror_more` appends segments owned by
+  whichever context is active (each chunk records its device; frees go through that queue). After a later stage's
+  cache exists, its profile-hot cache misses pin into the room `STRATA_MIRROR_MIB` left - only when that env is
+  explicit, so machines where the MemAvailable default already enabled stage 0's mirror see no change.
+  `stage_reads_host` opens the stage's PCIe lane when its segments belong to its own card, replacing the
+  compare-against-CUDA0 rule. The device plan's mirror table stopped being a process global: it travels in
+  `VerifyHits` per window, allocated on the same card as that window's residency table (this also retires the #1980
+  wrong-table fault structurally instead of by pointer-window luck). The existing `k22mirror6000/10000` arms are the
+  lane's test: neutral in 10-16 because they could only mirror stage 0 - rerun against `k22ref` at the daily shape.
+- **Item 8 - mtp_bind reservation: closed as no-code.** Every two-card mtp log charges CUDA0 `+0 MiB for the draft
+  head` (both the 10-16 runs and the 10-30 retry; slot counts byte-match the no-mtp control), the only `+143 MiB`
+  charges sit on A770-alone logs where the drafter lives, and the last stage's cache sizing already deducts the
+  drafter (`generate.cpp` stage-room comment). The handoff's premise matches neither the code nor the logs.
+- **Item 10**: cherry-picks only, as agreed - GRF done above; planar Q6_K deliberately not pulled; upstream's
+  Alchemist auto-defaults deliberately not copied (defaults stay byte-identical here).
+
+Bench queue (gate on, data only, no daily-config changes): L1 running - `k22ctx32k / chunk8k / pfxmx1 / grf` at the
+32K shape over chat,4K,8K,16K,agent, 3 sessions x 2 runs. Then L2 at the daily 64K shape - `k22ref / k22mirror10000
+/ k22help` over chat,2K,4K,agent; L3 drafter discriminators - `k22ctx32k / mtp / mtpnosfx / nosfx`, chat-heavy for
+the pollution verdict; L4 128K KV - `k22ctx128k / k8v4 / q4_0` with quality read second; L5 the B580-main helper
+tier (`tier4` arms) last, timeboxed, stop at the first load error. MTP stays parked whatever L3 says.
