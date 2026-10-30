@@ -25,6 +25,7 @@
 
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_math.hpp"
 #include "strata/sycl_queue.hpp"
@@ -35,6 +36,7 @@
 #include "s26_tsum.dp.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -1703,6 +1705,30 @@ inline int q6k_wide_rpw() {
     static const int v = std::getenv("STRATA_MMVQ_WIDE_RPW") ? std::atoi(std::getenv("STRATA_MMVQ_WIDE_RPW")) : 1;
     return v;
 }
+// Large-GRF mode (256 registers per thread instead of 128) for the wide kernels (Q6_K a2 and the generic one) at 2-8
+// columns: on the A770 they spill at 128, and mmvq_bench Q6_K 4 columns goes 70-80 -> 150-237 GB/s with the same
+// checksum.  Upstream defaults it on for Arc A-series; here it stays opt-in - STRATA_MMVQ_LARGE_GRF=1 on, =0 or unset
+// off, so the default path launches exactly the same kernels as before.  The kernels are Alchemist-wide, so
+// Battlemage and anything else stay off even with =1.  Per device, cached by device id - xmx_moe's mode() pattern
+// (prefill/xmx_moe.dp.cpp): one first-call-captures-the-queue static let the setup thread's card (device 0) answer
+// for all of them, which on a B580 + A770 layer split is never the A770's own answer; asking the calling thread's
+// current device answers each stage.
+inline bool mmvq_large_grf(dpct::queue_ptr s) {
+    static const int want = [] { const char* e = std::getenv("STRATA_MMVQ_LARGE_GRF");
+                                  return e != nullptr && std::atoi(e) != 0 ? 1 : 0; }();
+    if (want == 0) return false;                                // unset or =0: today's kernels, nothing consulted
+    const int dev = (int) dpct::get_current_device_id();
+    constexpr int kMaxLargeGrfDev = 16;                         // device ids past this: compute, don't cache
+    static std::atomic<int8_t> cached[kMaxLargeGrfDev] = {};    // 0 unknown, 1 off, 2 on
+    if (dev >= 0 && dev < kMaxLargeGrfDev) {
+        const int8_t c = cached[dev].load(std::memory_order_relaxed);
+        if (c) return c == 2;
+    }
+    const bool on = strata::intel_gpu_gen_of(s->get_device()) == strata::IntelGpuGen::Alchemist;
+    const int8_t v = on ? (int8_t) 2 : (int8_t) 1;
+    if (dev >= 0 && dev < kMaxLargeGrfDev) cached[dev].store(v, std::memory_order_relaxed);
+    return on;
+}
 template <int NCOLS>
 void launch_q6k_wide(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, dpct::queue_ptr s) {
     const auto* w = static_cast<const Q6KBlock*>(weights);
@@ -1726,6 +1752,17 @@ void launch_q6k_wide(const void* weights, const void* x_q8_1, float* y, int n_in
     }
     if (rpw == 1 && q6k_a2()) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+        if constexpr (NCOLS > 1) {
+            if (mmvq_large_grf(s)) {
+                s->parallel_for<dpct_kernel_name<class native_mmvq_q6k_wide_a2_grf256, dpct_kernel_scalar<NCOLS>>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
+                    sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>},
+                    [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                        native_mmvq_q6k_wide_kernel<NCOLS, 1, WARP, (int) sizeof(Q6KBlock), true>(w, x, y, n_in, n_out);
+                    });
+                return;
+            }
+        }
         s->parallel_for<dpct_kernel_name<class native_mmvq_q6k_wide_a2, dpct_kernel_scalar<NCOLS>>>(
             sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
             [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
@@ -1959,6 +1996,15 @@ void launch_wide(const void* weights, const void* x_q8_1, float* y, int n_in, in
     STRATA_WKR(2) STRATA_WKR(4)
 #undef STRATA_WKR
     const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+    if constexpr (NCOLS > 1) {
+        if (mmvq_large_grf(s)) {
+            s->parallel_for<dpct_kernel_name<class native_mmvq_wide_grf256, F, dpct_kernel_scalar<NCOLS>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
+                sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>},
+                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { native_mmvq_wide_kernel<F, NCOLS>(w, x, y, n_in, n_out); });
+            return;
+        }
+    }
     s->parallel_for<dpct_kernel_name<class native_mmvq_wide, F, dpct_kernel_scalar<NCOLS>>>(
         sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
         [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { native_mmvq_wide_kernel<F, NCOLS>(w, x, y, n_in, n_out); });
