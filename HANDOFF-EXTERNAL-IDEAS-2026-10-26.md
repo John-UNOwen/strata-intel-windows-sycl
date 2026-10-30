@@ -536,3 +536,23 @@ not the engine. Ladder stopped after ref sessions 1-2; rerun on a quiet machine 
 control included this time. L1's relative comparisons stand - its 12 sessions shared one environment.
 
 _(fill in after the rerun: chat/2K/4K/agent medians, lane effect on decode, 2K help effect, storm counts)_
+
+### The 64K streaming collapse (2026-10-30 bisect, blocks L2-L5 until cleared)
+
+Symptom: 64K-shape prompt streaming fell to ~70-78 tok/s (4K) from the saved 350-380, while decode stayed healthy
+(15-20 tok/s, 91-96% cache hits), chat TTFT ~1.6 s, expert-cache slots byte-matched the healthy-era log, PCIe probes
+fine at load (B580 3.6; A770 down from 16.0 to 13-14 GB/s - noted), disk 98% idle, pagefile unused. GPU compute
+engine reads 92-98% busy during the crawl with CPU near idle.
+
+Bisect (probe configs under `bench\arms\probe-*.json`, 4K probes, one variable each):
+- VRAM reserve 1536 (the healthy-era value): 77.6 - innocent.
+- 10-16-era engine rebuilt from `b53990b4` (worktree `..\wt1016`, its exe kept for A/B use): 76.3 - the engine is innocent.
+- `UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS` removed: 70.6 - innocent.
+- OBS closed (the only neighbour on the GPU engine): no change before or after.
+- The catalog python (`C:\mfg\tmp_catalog_keys.py`, since 10-26 23:19, ~0.5 core) was present during every fast run
+  before and after 10-26 - innocent (it is CPU-only; 32K stayed fast beside it all day).
+
+What remains is machine state: nine days on one boot (since 10-21) doing WDDM GPU work with storm/TDR history, a
+2.9 GB Memory Compression store, and a small A770 PCIe-probe drift. The era-exe result says a reboot - not a
+bisectable commit - is the hypothesis to test. L1's 32K numbers are unaffected (measured within one environment);
+they simply don't exercise the 64K allocation regime where the collapse lives.
