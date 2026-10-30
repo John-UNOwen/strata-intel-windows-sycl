@@ -304,3 +304,56 @@ arm run proves it runs clean at zero cost, but the engine's current storm rate (
 low for the run to demonstrate prevention statistically. Overnight VicGPT use is the acceptance test; if a
 storm still appears with the gate on, the shape has a mechanism the tier theory does not explain and item 3's
 window hashes are the next tool.
+
+## Progress (2026-10-30)
+
+### Merged
+
+`storm-controls` fast-forwarded onto `main` at `be4f63a8`: main now carries the staged-DMA switch, the
+`--adapt-idle` gate, the 8K bench phase, `tools/dsh_probe.py`, and this file.
+
+### 128K context measured (`k22ctx128k`, 1 session)
+
+Loads and serves 131072 tokens clean (3/3 runs, gate live), at a real cost: 4K prompt median 335.6 tok/s
+(318.7-335.9) with TTFT 12.05 s, against the same-week 32K band of 441-443 median at ~9.1 s - a ~24% prompt
+tax from the KV squeeze (A770 expert cache trimmed to 5118 slots; "CUDA1 reports no free memory" warnings in
+the load log). Context headroom is available and not free. The long-prompt/agent comparison against `k22ref`
+in one ladder is still open before adopting it for anything.
+
+### DSH as a client
+
+`serve\server.py` already speaks OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`), stream and
+non-stream, tools included - a harness can point at this port with no glue. `tools/dsh_probe.py` (commit
+`e2583836`) tests what a harness needs: `/health` and `/v1/models`, openai `tool_calls`, anthropic
+`tool_use`, and a tool call made from a needle buried 70% into a ~45K-token prompt. Point the harness
+endpoint only after three PASS lines. Known cost: the server serializes everyone behind one sequence - a
+10-16 s map chunk pauses harness turns and vice versa - so overnight windows are the quiet ones. Note:
+`MockServer.exe` (the mfg-decomp mock) had been squatting 8080/8081; stopped 2026-10-26, it should rebind
+to another port (owner plans the change).
+
+### MTP retry - the gate makes the parked measurement finally cheap
+
+The 2026-10-16 park ("unless a clean k22 run beats 18-24 tok/s", KB decision) named its own blocker: no k22
+mtp run ever finished clean, because storms tainted every fast number. With the gate in the base, the retry
+is cheap. Arm `k22ctx32kmtp` reproduces `strata-iq2_xs-2card-mtp-k22.json` (drafter `C:\strata-data\mtp\rt`,
+A770 squeezed to 13000 free, `STRATA_MTP_PREFILL_SYNC=1` - the drafter's VRAM bill is part of the shape).
+Pair it with `k22ctx32k` (same shape, no drafter, gated) in one ladder, chat suite on: the chat-phase decode
+medians are the verdict against the same-day control (the note's 18-24 bar is the 10-16 baseline; today's
+control median is the real bar), and the engine auto-disabling drafts mid-run is itself a verdict. Run:
+`BENCH_SUITES=chat,4K`, `BENCH_RUNS=4`, `BENCH_REPEATS=3`, arms `k22ctx32k k22ctx32kmtp`. A clean loss
+completes the park's ledger honestly; a win reopens it with the k22-mtp NaN story.
+
+### Review found a gate bug - async path only
+
+External review of the gate: with `--adapt-async 1`, the request-boundary call `adapt_tick(false, true)`
+returned as soon as it *started* the round (the Idle step posts the choose job and returned), leaving the
+round's marks, copies and flip to finish via the mid-request polls - during the request, the exact thing
+`--adapt-idle` forbids. Fix: the Idle step continues the state machine when the start is reached with `fin`
+set (the boundary case) - `a_ready(fin)` waits at every following step, so one boundary call runs the round
+through its flip; mid-request starts (`fin` false) return exactly where they always did. Scope: the blocking
+and pipeline boundaries were always correct (`adapt(); apply_pending(true)` finishes before the prompt), and
+the async worker only exists with `--adapt-async 1` plus the resident RAM mode - the daily shape runs neither
+(default off; `--stream-experts` on 32 GB cannot provide resident mode), so every measurement in this file
+was produced on the correctly-gated path. The fix is verified against the code and applied to the tree; both
+builds rebuild after the ladder running on this PC completes (ninja would take cores from the CPU expert lane
+and contaminate the measurement in progress), then commit.
