@@ -553,9 +553,13 @@ Bisect (probe configs under `bench\arms\probe-*.json`, 4K probes, one variable e
   before and after 10-26 - innocent (it is CPU-only; 32K stayed fast beside it all day).
 
 What remains is machine state: nine days on one boot (since 10-21) doing WDDM GPU work with storm/TDR history, a
-2.9 GB Memory Compression store, and a small A770 PCIe-probe drift. The era-exe result says a reboot - not a
-bisectable commit - is the hypothesis to test. L1's 32K numbers are unaffected (measured within one environment);
-they simply don't exercise the 64K allocation regime where the collapse lives.
+2.9 GB Memory Compression store, and a small A770 PCIe-probe drift. L1's 32K numbers are unaffected (measured
+within one environment); they simply don't exercise the 64K allocation regime where the collapse lives.
+
+**Confirmed by the reboot (10-30 16:0x):** `k22ref` 4K at the 64K shape runs 351.2 (342-360) after a restart - the
+healthy 10-16 band (352-380), against the collapsed 66-78. Machine state, not a commit; the era-exe probe (76.3 on
+the same tired machine) had already exonerated the code. Queue resumes from L2; the XeStrata section's `k22pcie0`
+(`--pcie-frac 0`, their item B4) joins L2 since the B580 carries a non-zero PCIe share (0.10 at load).
 
 ## XeStrata (2026-10-30)
 
