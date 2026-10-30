@@ -529,4 +529,10 @@ Storm tally L1: 1 polluted session in 12 (the XMX arm, agent run 2 t3; one sessi
 
 ### L2 results (daily 64K shape: mirror lane + copy-mode help vs ref)
 
-_(fill in: chat/2K/4K/agent medians, lane effect on decode, 2K help effect, storm counts)_
+Attempt 1 aborted 2026-10-30 early afternoon: the `k22ref` control collapsed (4K 66 tok/s vs its saved 360-380,
+agent TTFT 47-75 s) while decode (18 tok/s, 91-96% cache hits), slots, PCIe probes and the disk (98% idle) were
+all healthy - neighbour contention (OBS on the B580 3D engine; CPU-bound pythons on the pinned pool-worker cores),
+not the engine. Ladder stopped after ref sessions 1-2; rerun on a quiet machine (agreed with the owner), ref
+control included this time. L1's relative comparisons stand - its 12 sessions shared one environment.
+
+_(fill in after the rerun: chat/2K/4K/agent medians, lane effect on decode, 2K help effect, storm counts)_
