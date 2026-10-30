@@ -385,3 +385,86 @@ its history). The daily config now runs `--vram-reserve-mib 1024`: ~512 MiB retu
 (~+340 of the 5420 slots at the 32K/64K fills) and Task Manager should settle near 10.4/12 GB dedicated.
 The user is watching the card; anything pushing B580 dedicated past ~11.3 GB or shared GPU memory past 0.2 GB
 goes back toward 1300 or 1536.
+
+## Review of `14aa7933` and the open improvements (2026-10-30)
+
+### The async boundary fix is correct
+
+`14aa7933` makes the `Idle` step continue instead of return when the boundary call (`fin`) starts a round, so
+`a_ready(fin)` waits through `CopyBack`, `SwapIn` and `Commit` and the flip lands before the prompt. After `Commit`
+the loop returns to `Idle` with `a_win - a_last == 0` (`a_last` was just set and the boundary call does not
+advance `a_win`), so it stops there instead of starting a second round. Mid-request calls (`fin` false) take the
+old `return true`. Default, blocking and pipeline paths are unchanged. Not built here, only read.
+
+### Correction to an earlier remark: two-stage prompts already exist on the split
+
+Lamina's `--prompt-split` (one card on chunk N's later layers while the other starts chunk N+1) gave it 1.24-1.55x
+on 32K-128K prompts. A layer split already overlaps the stages of multi-chunk prompts: `docs/MULTI_GPU.md` says the
+idle-card help is off from ~3.3K tokens "where the stages overlap anyway". VicGPT's 8-18K prompts are multi-chunk,
+so there is nothing of Lamina's to port there. What Windows does lose is the **one-chunk** help (next item).
+
+### Open improvements, in the order to try them
+
+Each is opt-in or config-only, needs its own arm in `bench/arms/make_arms_k22.py` against a same-ladder control
+with the gate on, and none has been measured on this PC yet. (That generator is not in the repo yet; push it with
+the next arms.)
+
+**Prompt (VicGPT's map step is prompt-bound)**
+
+1. **Rerun the chunk-size arms under the gate.** `k22prefill16k`, `k22ctx32kchunk8k` and the 32K arms were void
+   because they stormed, not because they lost. Today's data says bigger reads pay: the 8K phase reads 510 tok/s
+   against 440 at 4K, and `own4096` was the one gate-checked prompt win (+35% at 4K). With the storm rate now
+   about 1 in 16 armed sessions, these arms can finally produce numbers. Start with `k22own4096` and
+   `--prefill auto:16384` on the 8K and 16K phases, gate on, `BENCH_REPEATS=3`.
+2. **Grouped XMX prompt experts on the A770 stage (item 4 above).** Still blocked by the first-caller `static` in
+   `xmx::mode()`: on the JIT split the B580 turns it off for both cards. Fix `mode()`, `stage_slots()` and
+   `dq_slots()` per device (`intel_gpu_gen_of`, as `gdn_xe_on` does), then arm `k22pfxmx1` = `STRATA_PF_XMX=1`
+   (mode 1 dequantizes, so it takes our IQ2_XXS gate/up; mode 2 does not). Upstream's +30-39% was mode 2 on an
+   A750; mode 1 on the A770's 26 layers is unmeasured.
+3. **A smaller KV cache at long context.** 128K cost ~24% prompt (335.6 against 441-443 tok/s at 4K), because the
+   KV squeezed the A770's expert cache to 5118 slots. Our tree has `--kv k8v4` (int8 K, rotated 4-bit V, 816 B per
+   cell against int8's 1,056, -23%) and `--kv q4_0` (half of int8). Upstream on a B70 at 128K: k8v4 with the KV
+   in VRAM read prompts fastest (1,006 tok/s, `docs/INTEL.md:344`). Arms: `k22ctx128kk8v4` against `k22ctx128k`,
+   and the same at 64K if the daily shape runs int8 KV. Read the storm gate first and the output's quality second
+   (4-bit V changes rounding: Lamina measured its k8v4 1.5-4.5x as far from llama.cpp as llama.cpp's own CPU and
+   CUDA backends). Not `--kv-resident` (KV streamed from "pinned" RAM): on Windows that RAM is pageable.
+
+**Decode**
+
+4. **Mirror the A770 stage's misses, then let it read them over PCIe** (speed items 1-2 of
+   `OPTIMIZATIONS-2026-10-16.md`). Still the largest decode lever: the A770 stage's misses all go to the CPU today.
+   lean-qwenflash's +51% decode came from exactly this (moving work out of the CPU lane). The mirror segment has
+   to be allocated through the A770's own queue, or its kernels read another context's memory (T3).
+5. **Large-GRF wide decode kernels on the A770 (item 5 above).** Our decode is all verify windows (T up to 6), which
+   is what these kernels serve. Port per device.
+6. **Optional: B580 main + A770 helper tier, for chat only.** No `--layer-split`; `--expert-cache-device1 auto
+   --remote-expert-opt`; keep `STRATA_VRAM_FREE_MIB` for the A770. The B580 is already device 0. Expect better
+   decode and much slower prompts (the helper tier serves decode only, so the prompt runs on the B580 alone:
+   96 tok/s measured at 3.4K tokens). Not for VicGPT. The helper path has not run across two Windows contexts yet.
+
+**MTP / pollution**
+
+7. **Separate the suffix drafter from the MTP drafter.** The 10-30 MTP storm fired with "48 of 48 windows' suffix
+   drafts accepted". None of the controls so far turned suffix drafting off (`k22ctx32kspec1p` explicitly does
+   not). `--suffix-draft 0` does (`generate.cpp:1949`, default 3). Arms: `k22ctx32kmtpnosfx` (the mtp arm plus
+   `--suffix-draft 0`) and `k22ctx32knosfx` (control plus `--suffix-draft 0`). If the mtp arm then runs clean,
+   the drafter is fine and the suffix path on the A770 stage is the lane. If it still pollutes, use item 3's
+   window hashes on the mtp shape.
+8. **Draft-head reservation on CUDA0** (robustness item 3 of `OPTIMIZATIONS-2026-10-16.md`): `mtp_bind` reserves
+   the drafter's VRAM on the B580 although the drafter lives on the last stage (the A770). Relevant again now
+   that the mtp arm is being run: it costs the B580 cache slots for nothing, and the A770 was squeezed to 13000
+   free MiB by hand to make room.
+
+**Short prompts (chat, agent turns)**
+
+9. **Re-enable the idle card's one-chunk prompt help across contexts.** Off on Windows today ("stage N reads its
+   prompts alone", `generate.cpp:7094`), because the helper's rows are mapped host memory both cards read in
+   place. Port the row exchange to copies, the way `Verifier::forward_handoff` already does for the window
+   hand-off. Upstream on 2x RTX 3090: 1.1K-token prompts 496 -> 723 tok/s, 2K 878 -> 1,128, 3K 1,260 -> 1,440;
+   no gain from ~3.3K tokens. Helps chat and agent turns, not VicGPT's map step. Medium-size port.
+
+**Housekeeping**
+
+10. **Merge upstream SYCL 0.1.45-0.1.48 in small steps.** It holds items 5 and 6 above (large GRF, planar Q6_K
+    head), the pageable-DMA fix (already ported) and upstream's Alchemist defaults. One step per arm round, with
+    the gate, so a new storm can be tied to a step.
