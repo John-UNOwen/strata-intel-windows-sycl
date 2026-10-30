@@ -1342,13 +1342,17 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
         if (ar_on()) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
-                          plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, nullptr, 0, cs, m_plan_err_);
+                          plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, nullptr, 0, cs, m_plan_err_,
+                          hits_.mirror_table ? hits_.mirror_table + (size_t) l * g.n_expert : nullptr,
+                          hits_.mirror_usage ? hits_.mirror_usage + (size_t) l * g.n_expert : nullptr);
         } else {
             if (device_plan_)   // E-6: every routed expert resident: this group's plan without the host
                 resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                               hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                               plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
-                              (uint32_t) ((l - lb_) * G + grp + 1), cs);
+                              (uint32_t) ((l - lb_) * G + grp + 1), cs, nullptr,
+                              hits_.mirror_table ? hits_.mirror_table + (size_t) l * g.n_expert : nullptr,
+                              hits_.mirror_usage ? hits_.mirror_usage + (size_t) l * g.n_expert : nullptr);
 #if defined(STRATA_USE_HIP)
             if (g_doorbell_store)   // #649 A/B: the step's ring stored, not incremented over PCIe
                 doorbell_publish_value(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,

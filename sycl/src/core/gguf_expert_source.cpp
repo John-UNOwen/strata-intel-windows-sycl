@@ -1,5 +1,6 @@
 // src/core/gguf_expert_source.cpp - see the header. Plain C++, no device code.
 #include "strata/core/gguf_expert_source.hpp"
+#include "strata/core/on_device.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
@@ -71,7 +72,8 @@ ssize_t fd_pread(int fd, void* dst, size_t n, int64_t off) { return ::pread(fd, 
 GgufExpertSource::~GgufExpertSource() { close(); }
 
 void GgufExpertSource::close() {
-    for (uint8_t* c : mirror_chunks_) if (c) sycl::free(c, dpct::get_in_order_queue());
+    for (auto& [c, odev] : mirror_chunks_)
+        if (c) { const OnDevice on(odev); sycl::free(c, dpct::get_in_order_queue()); }   // a card frees what its own queue mapped
     mirror_chunks_.clear();
     mirror_bytes_ = 0; mirror_ptr_.clear(); layer_first_.clear();
     for (int fd : fds_) fd_close(fd);
@@ -167,11 +169,25 @@ const uint8_t* GgufExpertSource::blob(int64_t layer, int64_t expert) {
 
 int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>& pairs, uint64_t cap, int threads,
                                  std::string& err) {
+    return mirror_into(pairs, cap, threads, err, true);
+}
+
+// The mirror lane (2026-10-30): append a segment without disturbing what is already mirrored - a later layer-split
+// stage's misses, pinned through THAT card's context (the caller's OnDevice scopes malloc_host below; each chunk's
+// recorded device id is its free ticket).  Pairs a segment already serves are skipped; the cap limits the added bytes.
+int64_t GgufExpertSource::mirror_more(const std::vector<std::pair<int64_t, int64_t>>& pairs, uint64_t cap, int threads,
+                                      std::string& err) {
+    return mirror_into(pairs, cap, threads, err, false);
+}
+
+int64_t GgufExpertSource::mirror_into(const std::vector<std::pair<int64_t, int64_t>>& pairs, uint64_t cap, int threads,
+                                      std::string& err, bool replace) {
     const auto& lay = strata::kernels::cpu::expert_layout();
     std::vector<std::pair<int64_t, int64_t>> take;
     uint64_t total = 0;
     for (const auto& [l, e] : pairs) {
         if (l < 0 || l >= n_layers_ || e < 0 || e >= n_expert_) continue;
+        if (!replace && !mirror_ptr_.empty() && mirror_ptr_[(size_t) (l * n_expert_ + e)] != nullptr) continue;   // already served
         const uint64_t b = (lay.bytes[(size_t) l] + 255) / 256 * 256;
         if (total + b > cap) break;
         take.push_back({l, e});
@@ -182,13 +198,14 @@ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>&
     // is built from chunks under that. Battlemage and the CUDA/HIP builds never hit the limit, but chunking is neutral
     // for them. One chunk per (up to) 2 GiB of experts.
     constexpr uint64_t kChunk = 2ull << 30;
-    std::vector<uint8_t*> chunks;
+    const int owner = (int) dpct::get_current_device_id();   // the context that maps these chunks; its own queue frees them
+    std::vector<std::pair<uint8_t*, int>> chunks;
     // Free every chunk unless the mirror is handed over to the object: covers an allocation failure, a failed read and
     // any exception (a container allocation, a std::thread that cannot be created) on the way out.
     struct ChunkCleanup {
-        std::vector<uint8_t*>& v;
+        std::vector<std::pair<uint8_t*, int>>& v;
         bool armed = true;
-        ~ChunkCleanup() { if (armed) for (uint8_t* c : v) if (c) sycl::free(c, dpct::get_in_order_queue()); }
+        ~ChunkCleanup() { if (armed) for (auto& [c, d] : v) if (c) { const OnDevice on(d); sycl::free(c, dpct::get_in_order_queue()); } }
     } cleanup{chunks};
     std::vector<uint8_t*> ptrs(take.size(), nullptr);
     uint64_t placed = 0;
@@ -210,7 +227,7 @@ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>&
                     err = "mirror: no pinned host memory for " + std::to_string(want >> 20) + " MiB";
                 return -1;
             }
-            chunks.push_back(nc);
+            chunks.push_back({nc, owner});
             cur = nc; cur_off = 0; cur_size = want;
         }
         ptrs[j] = cur + cur_off;
@@ -237,12 +254,22 @@ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>&
         err = "mirror: reading an expert from the GGUF failed";
         return -1;
     }
-    for (uint8_t* c : mirror_chunks_) if (c) sycl::free(c, dpct::get_in_order_queue());
-    mirror_chunks_ = std::move(chunks);
+    if (replace)
+        for (auto& [c, d] : mirror_chunks_) if (c) { const OnDevice on(d); sycl::free(c, dpct::get_in_order_queue()); }
+    if (replace) mirror_chunks_ = std::move(chunks);
+    else mirror_chunks_.insert(mirror_chunks_.end(), chunks.begin(), chunks.end());
     cleanup.armed = false;                                  // the chunks now belong to the object
-    mirror_bytes_ = total;
-    mirror_ptr_.assign((size_t) (n_layers_ * n_expert_), nullptr);
-    layer_first_.assign((size_t) n_layers_, nullptr);
+    if (replace) {
+        mirror_bytes_ = total;
+        mirror_ptr_.assign((size_t) (n_layers_ * n_expert_), nullptr);
+        layer_first_.assign((size_t) n_layers_, nullptr);
+    } else {
+        if (mirror_ptr_.empty()) {   // the first segment through the append path: fresh tables
+            mirror_ptr_.assign((size_t) (n_layers_ * n_expert_), nullptr);
+            layer_first_.assign((size_t) n_layers_, nullptr);
+        }
+        mirror_bytes_ += total;
+    }
     for (size_t j = 0; j < take.size(); ++j) {
         const auto [l, e] = take[j];
         mirror_ptr_[(size_t) (l * n_expert_ + e)] = ptrs[j];

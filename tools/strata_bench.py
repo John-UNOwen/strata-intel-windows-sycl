@@ -479,7 +479,8 @@ class Suite:
 
     def run(self):
         self.warm_up()
-        steps = [("chat", self.run_chat), ("4K", lambda: self.run_prompt(4096, "4K")),
+        steps = [("chat", self.run_chat), ("2K", lambda: self.run_prompt(2048, "2K")),
+                 ("4K", lambda: self.run_prompt(4096, "4K")),
                  ("8K", lambda: self.run_prompt(8192, "8K")),
                  ("16K", lambda: self.run_prompt(16384, "16K")), ("agent", self.run_agent)]
         if self.clients:

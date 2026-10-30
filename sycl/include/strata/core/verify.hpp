@@ -55,6 +55,10 @@ struct VerifyHits {
     const uint64_t* slot_off = nullptr;   ///< E-6: host per-slot offsets when slots differ in size (null: slot * blob)
     int64_t n_slots = 0;                  ///< E-6: how many (for the device copy)
     int64_t blob = 0;
+    const unsigned long long* mirror_table = nullptr;   ///< SYCL mirror lane: [n_layers * n_expert] pinned-host addresses
+                                                        ///< per (layer, expert), 0: no entry; null: this window runs no lane.
+                                                        ///< Allocated on d_res's card, sliced per layer at dispatch
+    int32_t* mirror_usage = nullptr;                    ///< device routing counts, same slice (profile-save shape); optional
 };
 
 class Verifier {

@@ -1129,6 +1129,9 @@ struct GpuStage {
     strata::core::ExpertCache cache;
     std::vector<std::pair<int32_t, int32_t>> profile;   ///< its layers' share of the profile, hottest first
     int32_t* d_res = nullptr;                            ///< the residency table on its device
+    unsigned long long* mirror_table_d = nullptr;        ///< the mirror lane: [n_layers][n_expert] pinned-host addresses for its
+                                                         ///< layers' segments, allocated on this stage's device (its verifier reads it in place)
+    bool mirror_lane = false;                            ///< segments mapped through this card's context serve its cache misses
     strata::core::Verifier ver;
     strata::core::Verifier ver_b;                        ///< --pipeline-windows: the odd windows' verifier
     strata::prefill::Prefill sp;
@@ -5103,6 +5106,44 @@ int main(int argc, char **argv) try {
                              "(%.2f GiB), %lld of its %zu profiled pairs; slot 0 verified\n",
                      st.dev, (long long) st.lb, (long long) (st.le - 1), (long long) st.cache.slots(), st.cache.gib(),
                      (long long) filled, st.profile.size());
+        // Mirror lane (open item 4, 2026-10-30): now that this cache exists, pin what it misses in host segments mapped
+        // through THIS card's context (the loop's OnDevice scopes the allocations; each chunk records its owner),
+        // profile-hottest first, into whatever room STRATA_MIRROR_MIB left after stage 0.  Only on an explicit env:
+        // the MemAvailable default quietly enables stage 0's mirror on Linux, and silently doubling pinned RAM there
+        // is not this switch's job.  stage_reads_host opens this stage's PCIe lane (its kernels read only its own
+        // segments); the prompt path's pinned-source DMAs are copy-engine reads, right from any card.
+        if (o.stream_experts && srcp == &gguf_src && std::getenv("STRATA_MIRROR_MIB") != nullptr) {
+            const uint64_t mcap = (uint64_t) std::atoll(std::getenv("STRATA_MIRROR_MIB")) << 20;
+            const uint64_t mleft = mcap > gguf_src.mirrored_bytes() ? mcap - gguf_src.mirrored_bytes() : 0;
+            std::vector<std::pair<int64_t, int64_t>> smiss;
+            for (const auto& pr : st.profile)   // this stage's share, hottest first: the cap drops the coldest pairs
+                if (st.cache.slot_of(pr.first, pr.second) == strata::core::kNotResident)
+                    smiss.push_back({pr.first, pr.second});
+            for (int64_t l = st.lb; l < st.le; ++l)   // pairs the profile does not list at all
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (st.cache.slot_of(l, e) == strata::core::kNotResident &&
+                        std::find(smiss.begin(), smiss.end(), std::pair<int64_t, int64_t>{l, e}) == smiss.end())
+                        smiss.push_back({l, e});
+            std::string merr;
+            const uint64_t mirrored_before = gguf_src.mirrored_bytes();
+            const int64_t got = gguf_src.mirror_more(smiss, mleft, 8, merr);
+            if (got < 0) {
+                std::fprintf(stderr, "strata generate: layer split: CUDA%d expert mirror: %s (its misses stay on the SSD)\n",
+                             st.dev, merr.c_str());
+            } else if (got > 0) {
+                std::vector<unsigned long long> mtab((size_t) (g.n_layers * g.n_expert), 0ull);
+                for (int64_t l = st.lb; l < st.le; ++l)
+                    for (int64_t e = 0; e < g.n_expert; ++e)
+                        if (gguf_src.pinned(l, e))
+                            mtab[(size_t) (l * g.n_expert + e)] = (unsigned long long) gguf_src.device_alias(l, e);
+                st.mirror_table_d = sycl::malloc_device<unsigned long long>(mtab.size(), dpct::get_in_order_queue());
+                dpct::get_in_order_queue().memcpy(st.mirror_table_d, mtab.data(), mtab.size() * sizeof(unsigned long long)).wait();
+                st.mirror_lane = true;
+                std::fprintf(stderr, "strata generate: layer split: CUDA%d mirrors %lld of its cache-missing experts (%.2f GiB pinned through its own "
+                                     "context); its misses go to kernels over PCIe, not the CPU\n",
+                             st.dev, (long long) got, (double) (gguf_src.mirrored_bytes() - mirrored_before) / 1073741824.0);
+            }
+        }
     }
     if (multi_gpu)
         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
@@ -5115,7 +5156,11 @@ int main(int argc, char **argv) try {
         int64_t later_misses = 0;
         for (auto& stp : stages) {
             const GpuStage& st = *stp;
-            later_misses += std::max<int64_t>(0, (st.le - st.lb) * g.n_expert - (int64_t) st.cache.slots());
+            int64_t held = (int64_t) st.cache.slots();
+            for (int64_t l = st.lb; l < st.le; ++l)   // the lane's segment covers what its cache misses (mirror lane, 2026-10-30)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (gguf_src.pinned(l, e)) ++held;
+            later_misses += std::max<int64_t>(0, (st.le - st.lb) * g.n_expert - held);
         }
         if (later_misses > 0 && no_host_split) {
             std::fprintf(stderr, "strata generate: REFUSED: %lld experts of the later layer-split stages are neither in VRAM nor mirrored "
@@ -7168,7 +7213,7 @@ int main(int argc, char **argv) try {
             usage_dev_srv = sycl::malloc_device<int32_t>((size_t) (g.n_layers * g.n_expert), dpct::get_in_order_queue());
             dpct::get_in_order_queue().memset(usage_dev_srv, 0, (size_t) (g.n_layers * g.n_expert) * 4).wait();
         }
-        if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d, usage_dev_srv, (long long) (g.n_layers * g.n_expert));
+        if (mirror_table_d) { vh.mirror_table = mirror_table_d; vh.mirror_usage = usage_dev_srv; }   // the mirror lane rides with this window's hits (per-window tables: resident_plan's trailing args)
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;
@@ -7195,7 +7240,8 @@ int main(int argc, char **argv) try {
         // computes that stage's misses instead.  STRATA_SPLIT_PCIE_FOREIGN=1 keeps the reads (for testing).
         auto stage_reads_host = [&](int st) {
             static const bool keep = [] { const char* e = std::getenv("STRATA_SPLIT_PCIE_FOREIGN"); return e && e[0] == '1'; }();
-            return keep || !strata::cross_context(split_stage_dev(st), 0);
+            return keep || !strata::cross_context(split_stage_dev(st), 0) ||
+           (st > 0 && stages[(size_t) st - 1]->mirror_lane);   // mirror lane: its segments were mapped through this card - its kernels read them in place
         };
         {
             bool cross = false;
@@ -7319,6 +7365,7 @@ int main(int argc, char **argv) try {
                     vs.blob = thits.blob;
                     vs.slot_off = gs.cache.slot_offsets();
                     vs.n_slots = gs.cache.slots();
+                    vs.mirror_table = gs.mirror_table_d;   // the lane's table lives on this card (null: no segment for these layers)
                     gs.ver.set_remote_expert_opt(remote_opt.get());
                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, std::max(o.spec, o.batch), err);
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
@@ -12438,7 +12485,7 @@ int main(int argc, char **argv) try {
             usage_dev = sycl::malloc_device<int32_t>((size_t) (g.n_layers * g.n_expert), dpct::get_in_order_queue());
             dpct::get_in_order_queue().memset(usage_dev, 0, (size_t) (g.n_layers * g.n_expert) * 4).wait();
         }
-        if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d, usage_dev, (long long) (g.n_layers * g.n_expert));
+        if (mirror_table_d) { vh.mirror_table = mirror_table_d; vh.mirror_usage = usage_dev; }   // the mirror lane rides with this window's hits
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;

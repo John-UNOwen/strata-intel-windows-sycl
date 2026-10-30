@@ -2390,6 +2390,9 @@ bool in_mirror_table(const int32_t* res_layer) {
     return g_mirror_entries <= 0 || res_layer - g_mirror_res < g_mirror_entries;
 }
 }
+// The globals above are kept for the CUDA-side shape of the call (a single device, no split): the SYCL mirror lane
+// passes the table per dispatch instead (resident_plan's trailing `mir` / `use`, from VerifyHits) and no longer
+// calls this setter.  It stays defined so the upstream call sites link.
 void resident_plan_set_mirror(const int32_t* d_res, const unsigned long long* mirror_table, int32_t* usage, long long entries) {
     g_mirror_entries = entries;
     g_usage = usage;
@@ -2398,11 +2401,13 @@ void resident_plan_set_mirror(const int32_t* d_res, const unsigned long long* mi
 }
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
-                   long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err) {
-    const unsigned long long* mir = nullptr;   // SYCL port: the layer's slice of the host-mirror table, if any
-    int32_t* use = nullptr;                    // the layer's slice of the device routing counts, if on
-    if (g_mirror_table != nullptr && in_mirror_table(res_layer)) mir = g_mirror_table + (res_layer - g_mirror_res);
-    if (g_usage != nullptr && in_mirror_table(res_layer)) use = g_usage + (res_layer - g_mirror_res);
+                   long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err,
+                   const unsigned long long* mir_lane, int32_t* use_lane) {
+    // the per-window mirror lane wins; the globals only serve calls that pass no table (no split today)
+    const unsigned long long* mir = mir_lane;
+    int32_t* use = use_lane;
+    if (mir == nullptr && g_mirror_table != nullptr && in_mirror_table(res_layer)) mir = g_mirror_table + (res_layer - g_mirror_res);
+    if (use == nullptr && g_usage != nullptr && in_mirror_table(res_layer)) use = g_usage + (res_layer - g_mirror_res);
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};

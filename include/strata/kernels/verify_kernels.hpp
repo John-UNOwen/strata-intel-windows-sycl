@@ -76,9 +76,14 @@ void copy_rows_strided(float* dst, const float* src, int64_t rows, int64_t w, in
 /// routing order, their entries ascending), no PCIe groups.  *skip = ring when it did, else 0.
 /// #871: without `skip` (the all-resident graph) an entry whose expert is not in VRAM cannot be planned: the plan is
 /// left empty and *plan_err (mapped host memory) is set to 1, so the host sees it instead of running a stale plan.
+/// SYCL mirror lane: `mir` is this layer's slice of the pinned-host mirror addresses ([n_expert], 0: none) and
+/// `use` this layer's slice of the device routing counts - both travel with the window's VerifyHits, so a layer-
+/// split stage's own verifier passes its own stage's table (or none): the plan then routes non-resident experts
+/// with a mirror entry to that address.  #1980's wrong-table fault cannot happen: there is no global to mismatch.
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
-                   long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err = nullptr);
+                   long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err = nullptr,
+                   const unsigned long long* mir = nullptr, int32_t* use = nullptr);
 /// wait_flag_ge that also returns when *skip == value (device memory).
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
 /// copy_i32_from_mapped unless *skip == value.
