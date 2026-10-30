@@ -468,3 +468,99 @@ the next arms.)
 10. **Merge upstream SYCL 0.1.45-0.1.48 in small steps.** It holds the large-GRF kernels and the planar Q6_K
     head (sections 5 and 6 of this file), the pageable-DMA fix (already ported) and upstream's Alchemist defaults. One step per arm round, with
     the gate, so a new storm can be tied to a step.
+
+## XeStrata (2026-10-30)
+
+`github.com/MistVVK/XeStrata` (head `721afe5`, xe0.2.8-1). An Intel-first port of upstream Strata, separate from
+upstream's own `sycl/` port that this fork is built on. Its GPU code was rewritten to SYCL + Level Zero from
+Strata 0.1.24 and has taken upstream's changes through 0.2.8 (our `sycl/` tree is 0.1.44.1). Japanese-first docs,
+English translations in `docs/*.md`. Read, not built or run here.
+
+**Why it matters.** On their Arc Pro B70 (Linux) it reads prompts 2.1-2.9x as fast and decodes 35-66% faster than
+upstream's `sycl/` port, i.e. our engine's base (`docs/XE.md`, 0.2.8 section; generate and serve). Those are their
+numbers on a 32 GB card, not ours.
+
+**What it has not tested.** Windows only on an RTX 3050 Laptop; Arc A-series only for arithmetic (an A380, no
+model run); no B580 or A770; no two-Arc split on Windows. Its two-GPU split was measured on a B70 + RTX 4070,
+which already runs every GPU in its own context (`Runtime::at(device)`), so the per-context problem we fixed
+after the fact is its starting design.
+
+**License.** XeStrata is LGPL-3.0-or-later (plus MIT for upstream's untouched files); this repo is MIT. Copying
+its code into a file makes that file LGPL. Reimplement the ideas below from the description, or decide on the
+license first.
+
+### A. Try XeStrata itself on this PC (largest possible gain, unknown risk)
+
+A same-day comparison is cheaper than porting 0.1.44 -> 0.2.8 by hand. It ships a Windows 7z
+(`XeStrata-<version>-windows-x64.7z`, GitHub Releases, with `SHA256SUMS`; needs the .NET 10 runtime and the VC++
+redistributable). Ask the user before any download and name the file and its size.
+
+- Point it at the existing IQ2_XS files instead of downloading again (setup takes a `--gguf-dir`; it never
+  deletes files there).
+- Check RAM first: its table asks ~48 GB RAM for IQ2_XS. With 32 GB it should fall into its "low-RAM mode" (VRAM
+  makes up for RAM); check what `xestrata --check` / setup says before loading.
+- Order: B580 alone, then A770 alone, then both with the split fixed at 22 (`--gpus` with B580 first,
+  `--layer-split 22`; its `auto` may pick a different split or the helper role). Same stop signals as always.
+- Compare against our k22 on the same day and the same prompts (4K, 8K, chat); its API is OpenAI-compatible on
+  port 8095, so `tools/strata_bench.py` should reach it. Check the output for storms the same way.
+- Known Arc-on-Windows risks it has not met: the A770 misreading allocations past 4 GiB (our
+  `STRATA_SYCL_JIT_STATELESS` fix), the two Arcs as separate Level Zero platforms, the WDDM shared budget.
+
+If it runs clean and faster, the fork's question becomes "what does XeStrata lack for VicGPT", not "what do we port".
+
+### B. Ideas to reimplement in our fork
+
+1. **Make the "pinned" arena actually pinned, per card.** XeStrata registers its ordinary-memory arena with
+   `sycl::ext::oneapi::experimental::prepare_for_device_copy` (the SYCL counterpart of `cudaHostRegister`; our
+   `pinned.dp.cpp:451` has a DPCT no-op there), in pieces no larger than the device's largest allocation, **once
+   per GPU context** (`PinnedArena::register_on(device)`, `src/core/pinned.cpp`). After registering it copies both
+   ends of every piece to the card and back and compares, because a UHD 770 accepted a registration and then
+   copied wrong bytes. On Windows it first checks the card's WDDM shared-memory budget and skips registration
+   past it (copies stay correct, just slower).
+   - Check first: is `SYCL_EXT_ONEAPI_COPY_OPTIMIZE` defined in oneAPI 2026.1's headers? (A different extension
+     from `SYCL_EXT_ONEAPI_USM_IMPORT`, which section 16 found missing.) A probe like `graph_probe.cpp` can
+     register 256 MiB on both cards' contexts and time a copy.
+   - What it buys: real DMA for arena and mirror shapes, and it is the base for the A770 mirror (improvement 4 in
+     the 10-30 list). The daily `--stream-experts` shape already copies through the stager's pinned buffers, so
+     expect little there.
+   - **Task Manager:** registered host memory may count as "Shared GPU memory". That would trip the 0.2 GB stop
+     signal while being normal. Agree on how to read it before the first run.
+2. **A per-stage check that a running kernel sees host writes.** XeStrata's verifier tests at start that a
+   kernel spinning on a host flag sees the host's write (`doorbell_visible`); where it fails it runs the window
+   as host-launched segments instead (`STRATA_VERIFY_SEGMENTED`). Our verify windows spin on host flags on both
+   cards, and the A770's flags must live in the A770's own context. A start-up check per stage is cheap
+   insurance and rules a whole class of silent wrong-data faults in or out for the storm hunt.
+3. **"Nothing queued on a card behind a window that waits for the host."** On the B70, a graph or copy submitted
+   while a verify window spun on the host did not return, and the engine stalled. XeStrata queues a window's
+   commit only after the window completes, and runs the adaptive tier only with no window in flight on either
+   card. For our MTP pollution lane: list what the drafter queues on the A770 while a window there waits on the
+   host, and test the serial ordering.
+4. **Check the B580 stage's PCIe share; try `--pcie-frac 0`.** XeStrata now splits misses between the CPU and
+   PCIe from times measured at start. Their RTX 4070 on PCIe 4.0 x4 decoded 15% faster once every miss went to
+   the CPU (IQ3_XXS 32K 49.9 -> 57-58.6 tok/s). Our B580 is on PCIe 3.0 x4, slower still. Read the B580 stage's
+   PCIe share in the start log; if it is above 0, arm `k22pcie0` (`--pcie-frac 0`) and read decode.
+5. **Bigger prompt chunks when VRAM is short.** XeStrata's `--prefill auto` (from upstream #583) falls back to a
+   96-slot ring, then sizes the int8 products' group scratch for one group's rows instead of the whole chunk. On
+   an RTX 4070 (IQ3_XXS, 32K) that raised the chunk from 8192 to 16384 and the prompt from 1,194 to 2,058 tok/s.
+   Our chunk is limited by VRAM too (2048 forced without borrowing, 4096 with own buffers). Pairs with the
+   chunk-size arms in the 10-30 list.
+6. **Concurrent map chunks: `--batch 2 --batch-groups 2`.** VicGPT's map chunks are independent. With two slots
+   in two groups on a layer split, each card works on one group while the other card works on the other.
+   XeStrata/upstream: 2x RTX A4000 ran four requests 25-30% faster in groups than in one group; B70 + 4070
+   batch 8 went 73.1 -> 77-79 tok/s. Our tree has `--batch-groups`. Costs VRAM per slot (fewer cached experts),
+   needs VicGPT to send two requests at once, and batching across two Windows contexts is untested.
+7. **Prompt hand-off in pieces** (`STRATA_HANDOFF_PIPE`, upstream `1d9758f8`). A chunk's rows go to the next card
+   in eight pieces so both cards' PCIe copies overlap. A 4096-token chunk's rows are ~210 MB, about 60 ms out
+   of the B580 over PCIe 3.0 x4: a 1-2% estimate for a 4K prompt. Low priority.
+8. **Use `STRATA_DECODE_TIMING=1`** (already in our tree) to see whether the GPU waits on the CPU's experts. That
+   decides between items 4 and 6 above and improvement 4 (the A770 mirror) in the 10-30 list.
+
+### Not usable here
+
+- `--pipeline-windows 2` by default on two Xe2 cards (+17-28% decode on two Arc Pro B65): needs the MTP drafter
+  (it pollutes on our split) and two Battlemage cards.
+- Split serving (one card reads prompts, the other decodes): needs `--mtp`, two whole-model engines and RAM for
+  two expert copies on Windows.
+- Route prior (`STRATA_ROUTE_PRIOR`): upstream and XeStrata took it back out of the defaults (it repeats itself in
+  long agent sessions).
+- `joint_matrix_prefetch` removal (IGC 2.28: B70 1K prompt 468 -> 751 tok/s): our tree does not call it.
