@@ -510,3 +510,23 @@ Bench queue (gate on, data only, no daily-config changes): L1 running - `k22ctx3
 / k22help` over chat,2K,4K,agent; L3 drafter discriminators - `k22ctx32k / mtp / mtpnosfx / nosfx`, chat-heavy for
 the pollution verdict; L4 128K KV - `k22ctx128k / k8v4 / q4_0` with quality read second; L5 the B580-main helper
 tier (`tier4` arms) last, timeboxed, stop at the first load error. MTP stays parked whatever L3 says.
+
+### L1 results (32K shape, 2026-10-30 afternoon; session-median-of-2 spread under 2% within each arm)
+
+Control `k22ctx32k` 3/3 clean: 4K 359 / 8K 424 / 16K 444 tok/s, chat decode 16.5, agent decode 16.3. (The
+ladder's first session ran cold all day - 288/310/317 - the numbers below pair against the two warm sessions.)
+
+| arm | 4K | 8K | 16K | chat decode | agent decode | verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| `chunk8k` (3/3 clean) | 397 (+10%) | 582 (+37%) | 723 (+64%) | 8.5 (-49%) | 7.3 (-55%) | the biggest prompt lever measured on this rig, and the decode bill is now explicit: 8K staging eats ~4 GiB of the B580 cache and the misses fall to the CPU lane |
+| `pfxmx1` (session 1 polluted at agent run 2 t3, gate skipped the rest) | 254 | 275 | 280 (-30..-37%) | 10.7 (-36%) | 9.9 | XMX mode 1 loses on this pack: dequant-to-FP16 per chunk costs more than the grouped GEMM saves. Upstream's win is the fused mode-2 kernels on their quants. Do not adopt; the switch stays for a future mode-2 port |
+| `grf` (3/3 clean) | 252-272 | 280-305 | 281-317 (-25..-31%) | 16.7 (flat) | 16.6 (flat) | the wide small-GEMV launches the prompt stream uses run worse with 256 GRF on our IQ2_XS quants; decode does not move because the resident-cache graph barely touches those kernels. Upstream's Q6_K-based win does not transplant; do not adopt |
+
+Reading that matters for the rest of the queue: chunk8k's halved decode is cache-squeeze landing on the CPU
+fallback - the same fallback the mirror lane exists to replace with PCIe. If L2 shows the lane paying for misses
+over PCIe, `chunk8k + STRATA_MIRROR_MIB` is the natural follow-up: keep the +64% prompt win, claw decode back.
+Storm tally L1: 1 polluted session in 12 (the XMX arm, agent run 2 t3; one session = data, not systemic).
+
+### L2 results (daily 64K shape: mirror lane + copy-mode help vs ref)
+
+_(fill in: chat/2K/4K/agent medians, lane effect on decode, 2K help effect, storm counts)_
