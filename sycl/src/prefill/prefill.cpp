@@ -609,7 +609,17 @@ struct PeerPrefill {
     float* host_rows = nullptr;           // the peer's result rows (mapped, portable)
     int32_t* host_src = nullptr;          // the peer's rows' tokens (mapped, portable)
     int32_t* host_bounds = nullptr;       // its group bounds (mapped, portable)
+    // A split across two SYCL contexts (Windows): a kernel reads another context's mapped host memory in place
+    // with wrong data and no error (probes T3/T5), so in cross mode every buffer a card's kernels touch is mapped
+    // through THAT card - host_x stays the primary's (its device uploads the activations), host_x2 / host_rows /
+    // host_src / host_bounds are the helper's (its device downloads the activations to its own buffer, writes its
+    // own rows out, reads its own tables), and the two hops the queues' own memcpys bridge are copies, which are
+    // correct from either side.  host_rows2 is the primary's copy its queue reads.  Cross false: exactly the buffers above, as before.
+    bool cross = false;                   // set in set_stage_helper (strata::cross_context)
+    float* host_x2 = nullptr;             // the helper's own copy of the activations; the bridge memcpy rides ps
+    float* host_rows2 = nullptr;          // the primary's own copy of the rows; the bridge memcpy rides m.cs
     size_t host_x_cap = 0, host_rows_cap = 0, host_src_cap = 0;   // elements
+    size_t host_x2_cap = 0, host_rows2_cap = 0;
     static constexpr size_t kHostBounds = 2 * (NE + NE / 16 + 2) + 64;
     int64_t back_at = 0, back_rows = 0;
     std::vector<int32_t> bounds_host;
@@ -638,6 +648,16 @@ struct PeerPrefill {
         if (s_cp) dpct::get_current_device().destroy_queue(s_cp);
         if (s_out) dpct::get_current_device().destroy_queue(s_out);
         if (s) dpct::get_current_device().destroy_queue(s);
+        if (cross) {   // these went through the helper card; a card frees what its own queue mapped (its queues drained above)
+            if (host_x2) sycl::free(host_x2, dpct::get_in_order_queue());
+            if (host_rows) sycl::free(host_rows, dpct::get_in_order_queue());
+            if (host_src) sycl::free(host_src, dpct::get_in_order_queue());
+            if (host_bounds) sycl::free(host_bounds, dpct::get_in_order_queue());
+            host_x2 = nullptr; host_x2_cap = 0;
+            host_rows = nullptr; host_rows_cap = 0;
+            host_src = nullptr; host_src_cap = 0;
+            host_bounds = nullptr;
+        }
         /*
         DPCT1093: The "prev" device may be not the one intended for use.
         Adjust the selected device if needed.
@@ -648,6 +668,7 @@ struct PeerPrefill {
         if (host_rows) sycl::free(host_rows, dpct::get_in_order_queue());
         if (host_src) sycl::free(host_src, dpct::get_in_order_queue());
         if (host_bounds) sycl::free(host_bounds, dpct::get_in_order_queue());
+        if (host_rows2) sycl::free(host_rows2, dpct::get_in_order_queue());
     }
 };
 
@@ -1605,6 +1626,9 @@ bool Prefill::set_stage_helper(Prefill *helper, std::string &err) try {
     */
     dpct::select_device(prev);
     if (!ok) { err = "prefill: the layer split's prompt help (streams and events)"; return false; }
+    // different SYCL contexts: the exchange runs in copy mode (per-card buffers + reader-queue bridge copies,
+    // bind_stage_helper's cross allocation) - in-place reads of the other card's mapped host memory are wrong there
+    pp->cross = strata::cross_context(h.device, m.device);
     helper_ = helper;
     m.help_pp = std::move(pp);
     return true;
@@ -1693,9 +1717,21 @@ bool Prefill::bind_stage_helper(int64_t T) {
         }
         };
         size_t bounds_cap = P.host_bounds ? PeerPrefill::kHostBounds : 0;
-        if (!grow(P.host_x, P.host_x_cap, (size_t) T * N) || !grow(P.host_rows, P.host_rows_cap, (size_t) T * K * N) ||
-            !grow(P.host_src, P.host_src_cap, (size_t) T * K) || !grow(P.host_bounds, bounds_cap, PeerPrefill::kHostBounds))
+        if (!grow(P.host_x, P.host_x_cap, (size_t) T * N)) return false;   // the primary's device uploads into it: its own card
+        if (P.cross) {
+            // mapped through the helper card: host_x2 is that card's queue's copy destination, host_rows its own
+            // write-out, host_src / host_bounds host-written tables its kernels read in place
+            const core::OnDevice onh(P.dev);
+            if (!grow(P.host_x2, P.host_x2_cap, (size_t) T * N) ||
+                !grow(P.host_rows, P.host_rows_cap, (size_t) T * K * N) ||
+                !grow(P.host_src, P.host_src_cap, (size_t) T * K) ||
+                !grow(P.host_bounds, bounds_cap, PeerPrefill::kHostBounds))
+                return false;
+        } else if (!grow(P.host_rows, P.host_rows_cap, (size_t) T * K * N) ||
+                   !grow(P.host_src, P.host_src_cap, (size_t) T * K) ||
+                   !grow(P.host_bounds, bounds_cap, PeerPrefill::kHostBounds))
             return false;
+        if (P.cross && !grow(P.host_rows2, P.host_rows2_cap, (size_t) T * K * N)) return false;   // the primary's own copy, read on m.cs
     }
     const core::OnDevice on(P.dev);
     mmq::iota(P.ident, T * K, P.s);           // the helper's row table: a refill may have overwritten its slots
@@ -3556,7 +3592,12 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             if (P.p2p) dpct::async_dpct_memcpy(
                                 P.mixed, P.dev, m.mixed, prevd,
                                 (size_t)T * N * 4, *ps);
-                            else copy_f32_wide(P.mixed, P.host_x, T * N, ps);
+                            else {
+                                // cross: this queue copies the activations into its own card's buffer (the copy
+                                // rides the ev_in barrier above); the wide copy reads only own-context memory
+                                if (P.cross) ps->memcpy(P.host_x2, P.host_x, (size_t) T * N * 4);
+                                copy_f32_wide(P.mixed, P.cross ? P.host_x2 : P.host_x, T * N, ps);
+                            }
                             P.back_at = rows_local;
                             P.back_rows = rows_peer;
                             if (P.p2p) {
@@ -4278,8 +4319,14 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     pt.mark(kPfCombine, cs);
                     if (peer_now) {   // multi-GPU: the peer's rows are in Dm (or, without P2P, in host memory)
                         (m.cs)->ext_oneapi_submit_barrier({*m.pp->ev_done});
-                        if (!m.pp->p2p)
-                            copy_f32_wide(m.Dm + (size_t) m.pp->back_at * N, m.pp->host_rows, m.pp->back_rows * N, m.cs);
+                        if (!m.pp->p2p) {
+                            // cross: the bridge copy is this queue's first command after that barrier, and the wide
+                            // copy reads only this card's own buffer
+                            if (m.pp->cross)
+                                m.cs->memcpy(m.pp->host_rows2, m.pp->host_rows, (size_t) m.pp->back_rows * N * 4);
+                            copy_f32_wide(m.Dm + (size_t) m.pp->back_at * N, m.pp->cross ? m.pp->host_rows2 : m.pp->host_rows,
+                                          m.pp->back_rows * N, m.cs);
+                        }
                     }
                     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values

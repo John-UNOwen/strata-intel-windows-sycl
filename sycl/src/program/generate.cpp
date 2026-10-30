@@ -7090,14 +7090,12 @@ int main(int argc, char **argv) try {
             std::vector<std::pair<strata::prefill::Prefill*, int>> paths{{&sp, 0}};
             for (const auto& st : stages) paths.emplace_back(&st->sp, st->dev);
             for (size_t i = 0; i < paths.size(); ++i) {
-                // Windows, the two cards in different SYCL contexts: the helper's rows are mapped host memory both cards
-                // read in place (strata::cross_context) - the stage reads its prompts alone
+                // Windows, the two cards in different SYCL contexts: the help runs in copy mode (per-card mapped
+                // buffers, the reader's queue bridges - set_stage_helper's cross mode), not with in-place reads
                 const int helper_dev = paths[(i + 1) % paths.size()].second;
-                if (strata::cross_context(helper_dev, paths[i].second)) {
-                    std::fprintf(stderr, "strata serve: stage %zu reads its prompts alone (its helper, CUDA%d, is in another "
-                                         "SYCL context)\n", i, helper_dev);
-                    continue;
-                }
+                if (strata::cross_context(helper_dev, paths[i].second))
+                    std::fprintf(stderr, "strata serve: stage %zu gets its one-chunk prompt help in copy mode "
+                                         "(its helper, CUDA%d, is in another SYCL context)\n", i, helper_dev);
                 const strata::core::OnDevice on(paths[i].second);
                 if (!paths[i].first->set_stage_helper(paths[(i + 1) % paths.size()].first, err)) {
                     std::fprintf(stderr, "strata serve: %s - stage %zu reads its prompts alone\n", err.c_str(), i);
