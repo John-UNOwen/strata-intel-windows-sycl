@@ -1032,10 +1032,18 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
 #endif
     // a pinned block per layer, in order; the layers past the first refusal in one pageable range (false: none)
     bool reserve_failed = false;
+    // STRATA_ARENA_PIN_GIB=N (opt-in): pin at most N GiB; the layers past it go to the pageable range. Windows lets
+    // cudaHostAlloc succeed past the WDDM shared budget, and the cache's later copies then fail "out of memory".
+    static const uint64_t pin_cap = [] {
+        const char* v = std::getenv("STRATA_ARENA_PIN_GIB");
+        const double g = v != nullptr ? std::atof(v) : 0.0;
+        return g > 0.0 ? (uint64_t) (g * 1073741824.0) : UINT64_MAX;
+    }();
     auto place_layers = [&](const std::function<void(int64_t)>& placed) {
         for (int64_t l = 0; l < n_layers; ++l) {
             void* p = nullptr;
-            if (cudaHostAlloc(&p, (size_t) room[(size_t) l], cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess) {
+            if (pinned_total + room[(size_t) l] > pin_cap ||
+                cudaHostAlloc(&p, (size_t) room[(size_t) l], cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess) {
                 (void) cudaGetLastError();
                 for (int64_t m = l; m < n_layers; ++m) tail_bytes_ += room[(size_t) m];
                 tail_ = reserve_pageable(tail_bytes_);
