@@ -8500,7 +8500,12 @@ int main(int argc, char **argv) try {
                     for (float& v : drive.d.usage) v *= o.adapt_decay;
                     ajob->post(a_choose);
                     astate = AState::CopyBack;
-                    return true;
+                    // the boundary call (fin) must not stop here: continuing the loop runs the round it just
+                    // started straight through, since a_ready(fin) waits at every following step.  Returning
+                    // would leave the marks and copies to the mid-request polls - the very thing --adapt-idle
+                    // forbids.  Mid-request starts (fin false) still return here, exactly as before.
+                    if (!fin) return true;
+                    continue;
                 case AState::CopyBack: {   // step 2: the evicted experts leave the GPU's plan
                     if (!a_ready(fin)) return true;
                     if (a_err.load()) return false;
