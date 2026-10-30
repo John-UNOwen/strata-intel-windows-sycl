@@ -94,6 +94,10 @@ public:
     /// requests freely: row t of a window at pos0 draws Philox(seed, pos0 + t), tied to the position it samples, not
     /// to how the text was cut into windows.  A rejected row's draw is discarded.
     void set_sampling(const strata::kernels::SamplerParams& sp) { sampling_ = sp; }
+    /// This request's token biases (n_vocab floats, added to the logits before the sampler's filters; -inf bans), or
+    /// empty for none.  Call after set_sampling, which replaces the whole parameter block.  The vector is uploaded only
+    /// when it differs from the last one.
+    bool set_logit_bias(const std::vector<float>& bias, std::string& err);
     /// The penalty histories for `penalty_last_n`: one row per window row, T rows of `history_len` int32 slots
     /// (`strata::kernels::penalty_rows`), device memory staged before every window; null: no penalties.
     void set_history(const int32_t* history, int history_len) { hist_d_ = history; hist_len_ = history_len; }
@@ -203,6 +207,8 @@ private:
     const int32_t* hist_d_ = nullptr;
     int hist_len_ = 0;
     bool head_sampling_ = true;
+    float* logit_bias_device_ = nullptr;      // n_vocab floats, on the head's GPU (set_logit_bias)
+    std::vector<float> logit_bias_host_;      // what logit_bias_device_ holds
 
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;

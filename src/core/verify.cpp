@@ -116,6 +116,7 @@ Verifier::~Verifier() {
                           sgjoin_})
         if (e) cudaEventDestroy(e);
     if (arena_) cudaFree(arena_);
+    if (logit_bias_device_) cudaFree(logit_bias_device_);
     if (xk_dev_) cudaFree(xk_dev_);
     if (stamps_) cudaFree(stamps_);
     void* hosts[] = {h_tok_, h_val_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_,
@@ -124,6 +125,33 @@ Verifier::~Verifier() {
                      h_list2_, h_xk_, h_xq1_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
+}
+
+bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) {
+    if (!bias.empty() && bias.size() != (size_t) n_vocab_) {
+        err = "logit_bias vocabulary size mismatch";
+        return false;
+    }
+    if (!bias.empty() && bias != logit_bias_host_) {
+        // the sampler reads the head's logits on the head's GPU: the bias goes on that GPU too
+        int prev = 0, dev = 0;
+        cudaGetDevice(&prev);
+        cudaPointerAttributes at{};
+        if (head_logits_ != nullptr && cudaPointerGetAttributes(&at, head_logits_) == cudaSuccess) dev = at.device;
+        else dev = prev;
+        if (dev != prev) cudaSetDevice(dev);
+        const size_t bytes = bias.size() * sizeof(float);
+        const bool ok = (logit_bias_device_ != nullptr || cudaMalloc((void**) &logit_bias_device_, bytes) == cudaSuccess) &&
+                        cudaMemcpy(logit_bias_device_, bias.data(), bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+        if (dev != prev) cudaSetDevice(prev);
+        if (!ok) {
+            err = "cannot upload logit_bias";
+            return false;
+        }
+        logit_bias_host_ = bias;
+    }
+    sampling_.logit_bias = bias.empty() ? nullptr : logit_bias_device_;
+    return true;
 }
 
 int Verifier::nonfinite(int T) {
@@ -1354,7 +1382,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         _mm_pause();
     }
     settle(true);
-    const bool sampled = head_sampling_ && ((!sampling_.greedy && sampling_.temperature > 0.0f) || hist_d_ != nullptr);
+    const bool sampled = head_sampling_ && ((!sampling_.greedy && sampling_.temperature > 0.0f) || hist_d_ != nullptr ||
+                                            sampling_.logit_bias != nullptr);
     const bool whole = shead_ != nullptr && (logits_wanted_ || sampled);
     if (shead_ != nullptr) {   // the head's input is handed over after the last layer: the second GPU's part then
         ++hand_n_;

@@ -16,6 +16,7 @@
 
 #include "strata/artifact/gguf_split.hpp"
 #include "strata/core/adaptive_tier.hpp"
+#include "strata/core/logit_bias.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/second_gpu.hpp"
 #include "strata/core/split_head.hpp"
@@ -3941,7 +3942,7 @@ int main(int argc, char** argv) {
             // what the server's Monitor tab shows
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);
-            std::printf("INFO context=%lld kv=%s kv_resident=0 expert_slots=%lld expert_cache_mib=%lld spec=%d "
+            std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=0 expert_slots=%lld expert_cache_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=0 arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f second_gpu=%d tail_role_token=%lld engine=" STRATA_VERSION " fork=custom\n",
                         (long long) o.max_context, o.kv.c_str(), (long long) xcache.slots(),
@@ -4016,6 +4017,8 @@ int main(int argc, char** argv) {
             int req_penalty_last_n = 0;
             double req_spec_min_p = o.spec_min_p;
             std::vector<int32_t> req_score;   // score=ID:ID:...: see the first window
+            std::string req_bias_text;        // logit_bias=ID:VALUE,...: this request's token biases (-100 bans)
+            bool req_bias_present = false;
             // img_keys=<hex>,<hex>,...: each picture's key from the server (its normalized bytes' hash), in prompt
             // order; the conversation cache then matches a picture by key and grid, not by its embedding floats
             std::vector<uint64_t> req_img_keys;
@@ -4041,6 +4044,7 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(v, nullptr, 10);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "logit_bias") { req_bias_text = v; req_bias_present = true; }
                     else if (key == "img_keys") {
                         req_img_keys.clear();
                         for (const char* q = v; *q != '\0';) {
@@ -4073,6 +4077,14 @@ int main(int argc, char** argv) {
             if (max_new < 1 || endp == nullptr || (geni && emb_path.empty()) || !parse_i64_list(endp, ids, pe)) {
                 std::printf("ERR bad request: %s\n", pe.empty() ? "max_new" : pe.c_str());
                 continue;
+            }
+            std::vector<float> req_bias;   // empty: no biases
+            {
+                std::string bias_err;
+                if (req_bias_present && !strata::core::parse_logit_bias(req_bias_text, (int) n_vocab, req_bias, bias_err)) {
+                    std::printf("ERR logit_bias: %s\n", bias_err.c_str());
+                    continue;
+                }
             }
             const int64_t n = (int64_t) ids.size();
             req_imgs.clear();
@@ -4202,6 +4214,14 @@ int main(int argc, char** argv) {
             req_sp.penalty_freq = req_penalty_freq;
             req_sp.penalty_present = req_penalty_present;
             ver.set_sampling(req_sp);
+            {   // after set_sampling, which replaces the parameter block the bias pointer lives in
+                std::string bias_err;
+                if (!ver.set_logit_bias(req_bias, bias_err)) {
+                    std::printf("ERR %s\n", bias_err.c_str());
+                    std::fflush(stdout);
+                    return 1;
+                }
+            }
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
             ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             req_tiers = tier_counters();

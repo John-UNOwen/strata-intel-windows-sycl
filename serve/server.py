@@ -7557,6 +7557,13 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
                 raise SystemExit(f"[strata] config sampling.experimental_speed_projection={value!r}: expected true or "
                                  "false (the default for requests that leave it out, when the engine has the vector)")
             out[key] = value
+        elif key == "logit_bias":            # default token biases for requests that send none: {"token_id": bias}
+            try:
+                bias = bias_api.normalize(value)
+            except ValueError as e:
+                raise SystemExit(f"[strata] config sampling.logit_bias: {e}")
+            if bias:
+                out[key] = bias
         else:
             print(f"[strata] config sampling.{key}={value!r}: unknown key, ignored", flush=True)
     return out
